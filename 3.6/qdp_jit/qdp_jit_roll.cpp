@@ -62,6 +62,7 @@ public:
   void collectAll( Instruction& I);
   void collectForStoresAllOperandsAll( SetVector<Value*>& tree );
   void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
+  void track( SetVector<Value*>& set);
   //void getAnalysisUsage(AnalysisUsage &AU) const override;
 
   const char *getPassName() const override { return "qdp_jit_roll"; }
@@ -71,6 +72,7 @@ public:
 
 private:
   BuilderTy *Builder;
+  SetVector<Value*> reduction;
 
   //PointerOffsetPair getPointerOffsetPair(LoadInst &);
   //bool combineLoads(DenseMap<const Value *, SmallVector<LoadPOPPair, 8>> &);
@@ -239,6 +241,99 @@ void qdp_jit_roll::add_GEPs(BasicBlock &BB) {
 
 
 
+void qdp_jit_roll::track( SetVector<Value*>& set) {
+  if (reduction.empty()) {
+    reduction.insert( set.begin() , set.end() );
+    return;
+  }
+
+  SetVector<Value*> reduction_stores;
+  for (Value *v : reduction ) {
+    if (isa<StoreInst>(*v)) {
+      reduction_stores.insert(v);
+    }
+  }
+  SetVector<Value*> set_stores;
+  for (Value *v : set ) {
+    if (isa<StoreInst>(*v)) {
+      set_stores.insert(v);
+    }
+  }
+
+  assert(reduction_stores.size() == set_stores.size());
+
+  bool mismatch = false;
+  bool offset_set = false;
+  uint64_t offset;
+
+  for (uint64_t i = 0 ; i < set_stores.size() && !mismatch; ++i ) {
+
+    SetVector<Value*> cmp0_visit;
+    SetVector<Value*> cmp1_visit;
+    cmp0_visit.insert( set_stores[0] );
+    cmp1_visit.insert( reduction_stores[0] );
+
+    while ( !cmp0_visit.empty() && !cmp1_visit.empty() && !mismatch ) {
+      Value* v0 = cmp0_visit.back();
+      Value* v1 = cmp1_visit.back();
+      cmp0_visit.pop_back();
+      cmp1_visit.pop_back();
+      if (Instruction * vi0 = dyn_cast<Instruction>(v0)) {
+	if (Instruction * vi1 = dyn_cast<Instruction>(v1)) {
+	  if ( vi0->getOpcode() == vi1->getOpcode() ) {
+	    //DEBUG(dbgs() << "found matching instructions " << *vi0 << " " << *vi1 << "\n");
+	    
+	    if (Instruction * gep0 = dyn_cast<GetElementPtrInst>(v0)) {
+	      if (Instruction * gep1 = dyn_cast<GetElementPtrInst>(v1)) {
+		//DEBUG(dbgs() << "found GEPs " << *gep0 << " " << *gep1 << "\n");
+		//DEBUG(dbgs() << "ops " << *gep0->getOperand(1) << " " << *gep1->getOperand(1) << "\n");
+		if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
+		  if (ConstantInt * ci1 = dyn_cast<ConstantInt>(gep1->getOperand(1))) {
+		    uint64_t off0 = ci0->getZExtValue();
+		    uint64_t off1 = ci1->getZExtValue();
+		    //DEBUG(dbgs() << "found Ints " << off0 << " " << off1 << "\n");
+		    if (offset_set) {
+		      if ( off0-off1 != offset && off0-off1 != 0 ) {
+			DEBUG(dbgs() << "found non-matching offsets " << off0 << " " << off1 << "\n");
+			mismatch = true;
+		      }
+		    } else {
+		      offset = off0 - off1;
+		      offset_set = true;
+		      DEBUG(dbgs() << "found matching offsets " << off0 << " " << off1 << "\n");
+		    }
+		  }
+		}
+	      }
+	    }
+
+	    for (Use& U0 : vi0->operands()) {
+	      cmp0_visit.insert(U0.get());
+	    }
+	    for (Use& U1 : vi1->operands()) {
+	      cmp1_visit.insert(U1.get());
+	    }
+	    if (cmp0_visit.size() != cmp1_visit.size())
+	      mismatch=true;
+	  } else {
+	    DEBUG(dbgs() << "found mismatching opcode" << *vi0 << " " << *vi1 << "\n");
+	    mismatch=true;
+	  }
+	} else {
+	  mismatch=true;
+	  // v1 is not an instruction
+	}
+      }
+    }
+  }
+  if (!mismatch) {
+    DEBUG(dbgs() << "use_set matches!" << "\n");
+  } else {
+    DEBUG(dbgs() << "use_set doesn't match!" << "\n");
+  }
+}
+
+
 
 bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
   DEBUG(dbgs() << "Running on BB"  << "\n");
@@ -252,21 +347,28 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
   add_GEPs(BB);
 
   SetVector<Value*> all_roots;
+  SetVector<Value*> processed;
 
 
   for (Instruction& I : BB) {
     if (isa<StoreInst>(I)) {
-      DEBUG(dbgs() << "Found StoreInst " << I << "\n");
-      collectRoots(I, all_roots);
-      DEBUG(dbgs() << "Number of roots found " << all_roots.size() << "\n");
-      SetVector<Value*> all_uses;
-      collectAllUses(all_roots,all_uses);      
-      collectForStoresAllOperandsAll(all_uses);
+      if (processed.count( &I ) == 0 ) {
+	DEBUG(dbgs() << "Found new StoreInst " << I << "\n");
+	collectRoots(I, all_roots);
+	DEBUG(dbgs() << "Number of roots found " << all_roots.size() << "\n");
+	SetVector<Value*> all_uses;
+	collectAllUses(all_roots,all_uses);      
+	collectForStoresAllOperandsAll(all_uses);
 
-      DEBUG(dbgs() << "Number of all uses " << all_uses.size() << "\n");
-      for (Value *v : all_uses)
-	DEBUG(dbgs() << *v << "\n");
+	DEBUG(dbgs() << "Number of all uses " << all_uses.size() << "\n");
+	for (Value *v : all_uses)
+	  DEBUG(dbgs() << *v << "\n");
 
+	track(all_uses);
+	processed.insert(all_uses.begin(),all_uses.end());
+      } else {
+	DEBUG(dbgs() << "Found already processed StoreInst " << I << "\n");
+      }
       // for (Use& U : I.operands()) {
       // 	Value* V = U.get();
       // 	if (dyn_cast<Instruction>(V)) {
