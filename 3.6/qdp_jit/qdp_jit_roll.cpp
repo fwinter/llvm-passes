@@ -42,11 +42,10 @@ namespace {
 
 
 class qdp_jit_roll : public BasicBlockPass {
-  LLVMContext *C;
-  const DataLayout *DL;
-  //  AliasAnalysis *AA;
-
 public:
+  const char *getPassName() const override { return "qdp_jit_roll"; }
+  static char ID;
+
   qdp_jit_roll()
       : BasicBlockPass(ID),
         C(nullptr), DL(nullptr) {
@@ -56,23 +55,33 @@ public:
   using llvm::Pass::doInitialization;
   bool doInitialization(Function &) override;
   bool runOnBasicBlock(BasicBlock &BB) override;
+
+protected:
   void add_GEPs(BasicBlock &BB);
   void collectRoots( Instruction& I, SetVector<Value*>& all_roots);
   void collectAllUses( SetVector<Value*>& to_visit, SetVector<Value*>& all_uses);
   void collectAll( Instruction& I);
   void collectForStoresAllOperandsAll( SetVector<Value*>& tree );
   void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
-  void track( SetVector<Value*>& set);
+  bool track( SetVector<Value*>& set);
   //void getAnalysisUsage(AnalysisUsage &AU) const override;
 
-  const char *getPassName() const override { return "qdp_jit_roll"; }
-  static char ID;
+  struct reduction {
+    SetVector<Value*> instructions;
+    std::vector<int64_t> offsets;
+  };
 
-  typedef IRBuilder<true, TargetFolder> BuilderTy;
 
 private:
+  std::vector<reduction> reductions;
+
+  typedef IRBuilder<true, TargetFolder> BuilderTy;
+  LLVMContext *C;
+  const DataLayout *DL;
+  //  AliasAnalysis *AA;
+
   BuilderTy *Builder;
-  SetVector<Value*> reduction;
+
 
   //PointerOffsetPair getPointerOffsetPair(LoadInst &);
   //bool combineLoads(DenseMap<const Value *, SmallVector<LoadPOPPair, 8>> &);
@@ -241,14 +250,21 @@ void qdp_jit_roll::add_GEPs(BasicBlock &BB) {
 
 
 
-void qdp_jit_roll::track( SetVector<Value*>& set) {
-  if (reduction.empty()) {
-    reduction.insert( set.begin() , set.end() );
-    return;
+bool qdp_jit_roll::track( SetVector<Value*>& set) {
+  if (reductions.empty()) {
+    reductions.push_back( reduction() );
   }
 
+  if (reductions[0].instructions.empty()) {
+    reductions[0].instructions.insert( set.begin() , set.end() );
+    reductions[0].offsets.push_back(0);
+    return false;
+  }
+
+  reduction& cur_reduction = reductions[0];
+
   SetVector<Value*> reduction_stores;
-  for (Value *v : reduction ) {
+  for (Value *v : cur_reduction.instructions ) {
     if (isa<StoreInst>(*v)) {
       reduction_stores.insert(v);
     }
@@ -264,7 +280,7 @@ void qdp_jit_roll::track( SetVector<Value*>& set) {
 
   bool mismatch = false;
   bool offset_set = false;
-  uint64_t offset;
+  uint64_t offset = 0;
 
   for (uint64_t i = 0 ; i < set_stores.size() && !mismatch; ++i ) {
 
@@ -328,10 +344,18 @@ void qdp_jit_roll::track( SetVector<Value*>& set) {
   }
   if (!mismatch) {
     DEBUG(dbgs() << "use_set matches!" << "\n");
+    cur_reduction.offsets.push_back( offset );
+    return true;
   } else {
-    DEBUG(dbgs() << "use_set doesn't match!" << "\n");
+    DEBUG(dbgs() << "use_set doesn't match! Will add another reduction" << "\n");
+    reductions.push_back( reduction() );
+    reductions.back().instructions.insert( set.begin() , set.end() );
+    reductions.back().offsets.push_back(0);
+    return false;
   }
+    
 }
+
 
 
 
@@ -348,6 +372,7 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
 
   SetVector<Value*> all_roots;
   SetVector<Value*> processed;
+  SetVector<Value*> for_erasure;
 
 
   for (Instruction& I : BB) {
@@ -364,7 +389,10 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
 	for (Value *v : all_uses)
 	  DEBUG(dbgs() << *v << "\n");
 
-	track(all_uses);
+	if (track(all_uses)) {
+	  for_erasure.insert( all_uses.begin(), all_uses.end() );
+	}
+
 	processed.insert(all_uses.begin(),all_uses.end());
       } else {
 	DEBUG(dbgs() << "Found already processed StoreInst " << I << "\n");
@@ -380,6 +408,22 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
       //use_empty = " << I.use_empty() << "\n");
     }
   }
+
+  DEBUG(dbgs() << "All offsets:\n");
+  for ( uint64_t offset : reductions[0].offsets ) {
+    DEBUG(dbgs() << offset << " ");
+  }
+  DEBUG(dbgs() << "\n");
+
+  for ( Value* v: for_erasure ) {
+    if (Instruction *Inst = dyn_cast<Instruction>(v)) {
+      DEBUG(dbgs() << "erasure: " << *Inst << "\n");
+      if (!Inst->use_empty())
+	Inst->replaceAllUsesWith(UndefValue::get(Inst->getType()));
+      Inst->eraseFromParent();
+    }
+  }
+
 
 
   //AA = &getAnalysis<AliasAnalysis>();
