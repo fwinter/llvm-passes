@@ -30,6 +30,7 @@
 #include "llvm/ADT/SetVector.h"
 #include <queue>
 #include <vector>
+#include <algorithm>
 
 using namespace llvm;
 
@@ -41,22 +42,27 @@ using namespace llvm;
 namespace {
 
 
-class qdp_jit_roll : public BasicBlockPass {
+class qdp_jit_roll : public FunctionPass {
 public:
   const char *getPassName() const override { return "qdp_jit_roll"; }
   static char ID;
 
   qdp_jit_roll()
-      : BasicBlockPass(ID),
+      : FunctionPass(ID),
         C(nullptr), DL(nullptr) {
     initializeSROAPass(*PassRegistry::getPassRegistry());
   }
   
-  using llvm::Pass::doInitialization;
-  bool doInitialization(Function &) override;
-  bool runOnBasicBlock(BasicBlock &BB) override;
+  //  using llvm::Pass::doInitialization;
+  //bool doInitialization(Function &) override;
+  bool runOnFunction(Function &F) override;
 
 protected:
+  struct reduction {
+    SetVector<Value*> instructions;
+    std::vector<int64_t> offsets;
+  };
+
   void add_GEPs(BasicBlock &BB);
   void collectRoots( Instruction& I, SetVector<Value*>& all_roots);
   void collectAllUses( SetVector<Value*>& to_visit, SetVector<Value*>& all_uses);
@@ -64,12 +70,9 @@ protected:
   void collectForStoresAllOperandsAll( SetVector<Value*>& tree );
   void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
   bool track( SetVector<Value*>& set);
+  void modify_loop_body( reduction& red , Value* ind_var , int64_t offset_normalize );
   //void getAnalysisUsage(AnalysisUsage &AU) const override;
 
-  struct reduction {
-    SetVector<Value*> instructions;
-    std::vector<int64_t> offsets;
-  };
 
 
 private:
@@ -90,17 +93,17 @@ private:
 };
 }
 
-bool qdp_jit_roll::doInitialization(Function &F) {
-  DEBUG(dbgs() << "qdp_jit_roll function: " << F.getName() << "\n");
-  C = &F.getContext();
-  DataLayoutPass *DLP = getAnalysisIfAvailable<DataLayoutPass>();
-  if (!DLP) {
-    DEBUG(dbgs() << "  Skipping qdp_jit_roll -- no target data!\n");
-    return false;
-  }
-  DL = &DLP->getDataLayout();
-  return true;
-}
+// bool qdp_jit_roll::doInitialization(Function &F) {
+//   DEBUG(dbgs() << "qdp_jit_roll function: " << F.getName() << "\n");
+//   C = &F.getContext();
+//   DataLayoutPass *DLP = getAnalysisIfAvailable<DataLayoutPass>();
+//   if (!DLP) {
+//     DEBUG(dbgs() << "  Skipping qdp_jit_roll -- no target data!\n");
+//     return false;
+//   }
+//   DL = &DLP->getDataLayout();
+//   return true;
+// }
 
 
 
@@ -280,7 +283,7 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
 
   bool mismatch = false;
   bool offset_set = false;
-  uint64_t offset = 0;
+  int64_t offset = 0;
 
   for (uint64_t i = 0 ; i < set_stores.size() && !mismatch; ++i ) {
 
@@ -305,8 +308,8 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
 		//DEBUG(dbgs() << "ops " << *gep0->getOperand(1) << " " << *gep1->getOperand(1) << "\n");
 		if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
 		  if (ConstantInt * ci1 = dyn_cast<ConstantInt>(gep1->getOperand(1))) {
-		    uint64_t off0 = ci0->getZExtValue();
-		    uint64_t off1 = ci1->getZExtValue();
+		    int64_t off0 = ci0->getZExtValue();
+		    int64_t off1 = ci1->getZExtValue();
 		    //DEBUG(dbgs() << "found Ints " << off0 << " " << off1 << "\n");
 		    if (offset_set) {
 		      if ( off0-off1 != offset && off0-off1 != 0 ) {
@@ -353,19 +356,43 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
     reductions.back().offsets.push_back(0);
     return false;
   }
-    
 }
 
 
 
+void qdp_jit_roll::modify_loop_body( reduction& red , Value* ind_var , int64_t offset_normalize )
+{
+  for( Value* V : red.instructions ) {
+    if (GetElementPtrInst * gep0 = dyn_cast<GetElementPtrInst>(V)) {
+      if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
+	int64_t off0 = ci0->getZExtValue();
+	int64_t off_new = off0 + offset_normalize;
+	if (off_new) {
+	  DEBUG(dbgs() << "Change offset " << off0 << " to " << off_new << "\n");
+	  Builder->SetInsertPoint(gep0);
+	  Value *new_gep_address = Builder->CreateAdd( ind_var , 
+						       ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
+									 off0 + offset_normalize ) );
+	  gep0->setOperand( 1 , new_gep_address );
+	} else {
+	  gep0->setOperand( 1 , ind_var );
+	}
+      }
+    }
+  }
+}
 
-bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
-  DEBUG(dbgs() << "Running on BB"  << "\n");
+
+
+bool qdp_jit_roll::runOnFunction(Function &F) {
+  DEBUG(dbgs() << "Running on F"  << "\n");
+
+  BasicBlock& BB = F.getEntryBlock();
 
   IRBuilder<true, TargetFolder> TheBuilder(BB.getContext(), TargetFolder(DL));
   Builder = &TheBuilder;
 
-  if (skipOptnoneFunction(BB) || !DL)
+  if (skipOptnoneFunction(F))
     return false;
 
   add_GEPs(BB);
@@ -391,7 +418,9 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
 
 	if (track(all_uses)) {
 	  for_erasure.insert( all_uses.begin(), all_uses.end() );
+	  DEBUG(dbgs() << "Use set will be erased!" << "\n");
 	}
+	
 
 	processed.insert(all_uses.begin(),all_uses.end());
       } else {
@@ -409,11 +438,43 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
     }
   }
 
+  std::sort(reductions[0].offsets.begin(),reductions[0].offsets.end());
   DEBUG(dbgs() << "All offsets:\n");
-  for ( uint64_t offset : reductions[0].offsets ) {
+  for ( auto offset : reductions[0].offsets ) {
     DEBUG(dbgs() << offset << " ");
   }
   DEBUG(dbgs() << "\n");
+
+  auto offset_max = max_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
+  auto offset_min = min_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
+  auto offset_step = 0;
+  int64_t offset_normalize = 0;
+
+  if (*offset_min < 0) {
+    DEBUG(dbgs() << "Found negative offsets, will normalize!\n");
+    offset_normalize = *offset_min;
+    for ( auto& offset : reductions[0].offsets ) {
+      offset += offset_normalize;
+    }
+  }
+
+  if (reductions[0].offsets.size() > 1) {
+    offset_step = reductions[0].offsets[1] - reductions[0].offsets[0];
+
+    for ( int64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
+      if (std::find(reductions[0].offsets.begin(),reductions[0].offsets.end(),i ) == reductions[0].offsets.end()) {
+	DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
+	DEBUG(dbgs() << "Iteration " << i << " not found! Can't roll code into a loop.\n");
+	return false;
+      }
+    }
+  }
+
+  DEBUG(dbgs() 
+	<< "Loop rolling is possible with: min = " << *offset_min 
+	<< "   max = " << *offset_max 
+	<< "  step = " << offset_step << "\n");  
+
 
   for ( Value* v: for_erasure ) {
     if (Instruction *Inst = dyn_cast<Instruction>(v)) {
@@ -424,7 +485,45 @@ bool qdp_jit_roll::runOnBasicBlock(BasicBlock &BB) {
     }
   }
 
+  ReturnInst* RI;
+  for (Instruction& I : BB) {
+    if (ReturnInst* RI0 = dyn_cast<ReturnInst>(&I)) {
+      RI = RI0;
+      DEBUG(dbgs() << "found ret " << *RI << "\n");
+    }
+  }
+  RI->eraseFromParent();
+  DEBUG(dbgs() << "done removing " << "\n");
 
+  llvm::BasicBlock *BB0 = llvm::BasicBlock::Create(llvm::getGlobalContext(), "pre_loop" );
+  F.getBasicBlockList().push_front(BB0);
+
+  llvm::BasicBlock *BBe = llvm::BasicBlock::Create(llvm::getGlobalContext(), "exit_loop" );
+  F.getBasicBlockList().push_back(BBe);
+  Builder->SetInsertPoint(BBe);
+  Builder->CreateRetVoid();
+
+  Builder->SetInsertPoint(BB0);
+  Builder->CreateBr(&BB);
+
+  Builder->SetInsertPoint(&BB,BB.begin());
+  PHINode * PN = Builder->CreatePHI( Type::getIntNTy(getGlobalContext(),64) , 2 );
+
+  Builder->SetInsertPoint(&BB,BB.end());
+
+  Value *PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , offset_step ) );
+  Value *cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_max ) );
+
+  PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_min ) , BB0 );
+  PN->addIncoming( PNp1 , &BB );
+
+  Builder->CreateCondBr( cond , BBe, &BB);
+  
+
+  modify_loop_body( reductions[0] , PN , offset_normalize );
+
+
+  F.dump();
 
   //AA = &getAnalysis<AliasAnalysis>();
 
@@ -446,7 +545,7 @@ char qdp_jit_roll::ID = 0;
 static RegisterPass<qdp_jit_roll> X("qdp_jit_roll", "QDP-JIT roll linear code into loop");
 
 
-BasicBlockPass *llvm::create_qdp_jit_roll_pass() {
+FunctionPass *llvm::create_qdp_jit_roll_pass() {
   return new qdp_jit_roll();
 }
 
