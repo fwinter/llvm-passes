@@ -30,6 +30,7 @@
 #include "llvm/ADT/SetVector.h"
 #include <queue>
 #include <vector>
+#include <sstream>
 #include <algorithm>
 
 using namespace llvm;
@@ -61,7 +62,9 @@ protected:
   struct reduction {
     SetVector<Value*> instructions;
     std::vector<int64_t> offsets;
+    int id;
   };
+  typedef std::vector<reduction> reductions_t;
 
   void add_GEPs(BasicBlock &BB);
   void collectRoots( Instruction& I, SetVector<Value*>& all_roots);
@@ -71,12 +74,13 @@ protected:
   void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
   bool track( SetVector<Value*>& set);
   void modify_loop_body( reduction& red , Value* ind_var , int64_t offset_normalize );
+  bool insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* successor);
   //void getAnalysisUsage(AnalysisUsage &AU) const override;
 
 
 
 private:
-  std::vector<reduction> reductions;
+  reductions_t reductions;
 
   typedef IRBuilder<true, TargetFolder> BuilderTy;
   LLVMContext *C;
@@ -248,115 +252,163 @@ void qdp_jit_roll::add_GEPs(BasicBlock &BB) {
       	}
       }
     }
+    if (LoadInst* LI = dyn_cast<LoadInst>(&I)) {
+      //DEBUG(dbgs() << "Found LoadInst " << LI << "\n");
+      
+      for (Use& U : I.operands()) {
+      	Value* V = U.get();
+      	if (!dyn_cast<Instruction>(V)) {
+      	  //DEBUG(dbgs() << "Found argument " << *V << "\n");
+	  std::vector<llvm::Value*> vect_1;
+	  vect_1.push_back(Builder->getInt64(0));
+
+	  llvm::GetElementPtrInst* gep1 = llvm::GetElementPtrInst::Create( V , ArrayRef< Value * >(vect_1) );
+
+	  BB.getInstList().insert(&I, gep1);
+
+	  LI->setOperand( 0 , gep1 );
+      	}
+      }
+    }
   }
 }
 
 
 
 bool qdp_jit_roll::track( SetVector<Value*>& set) {
+  DEBUG(dbgs() << "\n Track set with " << set.size() << " instructions.\n");
+
+  static int id;
+
   if (reductions.empty()) {
     reductions.push_back( reduction() );
-  }
-
-  if (reductions[0].instructions.empty()) {
     reductions[0].instructions.insert( set.begin() , set.end() );
     reductions[0].offsets.push_back(0);
+    reductions[0].id = id++;
     return false;
   }
 
-  reduction& cur_reduction = reductions[0];
 
-  SetVector<Value*> reduction_stores;
-  for (Value *v : cur_reduction.instructions ) {
-    if (isa<StoreInst>(*v)) {
-      reduction_stores.insert(v);
+  bool reduction_found = false;
+
+  for (reductions_t::iterator cur_reduction = reductions.begin();
+       cur_reduction != reductions.end() && !reduction_found ; 
+       ++cur_reduction ) {
+
+    DEBUG(dbgs() << "Trying reduction " << cur_reduction->id << "\n");
+
+    DEBUG(dbgs() << "current reduction: " << "\n");
+    SetVector<Value*> reduction_stores;
+    for (Value *v : cur_reduction->instructions ) {
+      DEBUG(dbgs() << *v << "\n");
+      if (isa<StoreInst>(*v)) {
+	reduction_stores.insert(v);
+      }
     }
-  }
-  SetVector<Value*> set_stores;
-  for (Value *v : set ) {
-    if (isa<StoreInst>(*v)) {
-      set_stores.insert(v);
+    DEBUG(dbgs() << "incoming set: " << "\n");
+    SetVector<Value*> set_stores;
+    for (Value *v : set ) {
+      DEBUG(dbgs() << *v << "\n");
+      if (isa<StoreInst>(*v)) {
+	set_stores.insert(v);
+      }
     }
-  }
 
-  assert(reduction_stores.size() == set_stores.size());
+    if (cur_reduction->instructions.size() != set.size()) {
+      DEBUG(dbgs() << " -> number of instructions not identical, " << cur_reduction->instructions.size() << " " << set.size() << "\n");
+      continue;
+    }
 
-  bool mismatch = false;
-  bool offset_set = false;
-  int64_t offset = 0;
+    if (reduction_stores.size() != set_stores.size()) {
+      DEBUG(dbgs() << " -> number of stores not identical, " << reduction_stores.size() << " " << set_stores.size() << "\n");
+      continue;
+    }
 
-  for (uint64_t i = 0 ; i < set_stores.size() && !mismatch; ++i ) {
+    bool mismatch = false;
+    bool offset_set = false;
+    int64_t offset = 0;
 
-    SetVector<Value*> cmp0_visit;
-    SetVector<Value*> cmp1_visit;
-    cmp0_visit.insert( set_stores[0] );
-    cmp1_visit.insert( reduction_stores[0] );
+    for (uint64_t i = 0 ; i < set_stores.size() && !mismatch; ++i ) {
 
-    while ( !cmp0_visit.empty() && !cmp1_visit.empty() && !mismatch ) {
-      Value* v0 = cmp0_visit.back();
-      Value* v1 = cmp1_visit.back();
-      cmp0_visit.pop_back();
-      cmp1_visit.pop_back();
-      if (Instruction * vi0 = dyn_cast<Instruction>(v0)) {
-	if (Instruction * vi1 = dyn_cast<Instruction>(v1)) {
-	  if ( vi0->getOpcode() == vi1->getOpcode() ) {
-	    //DEBUG(dbgs() << "found matching instructions " << *vi0 << " " << *vi1 << "\n");
+      SetVector<Value*> cmp0_visit;
+      SetVector<Value*> cmp1_visit;
+      cmp0_visit.insert( set_stores[0] );
+      cmp1_visit.insert( reduction_stores[0] );
+
+      while ( !cmp0_visit.empty() && !cmp1_visit.empty() && !mismatch ) {
+	Value* v0 = cmp0_visit.back();
+	Value* v1 = cmp1_visit.back();
+	cmp0_visit.pop_back();
+	cmp1_visit.pop_back();
+	if (Instruction * vi0 = dyn_cast<Instruction>(v0)) {
+	  if (Instruction * vi1 = dyn_cast<Instruction>(v1)) {
+	    if ( vi0->getOpcode() == vi1->getOpcode() ) {
+	      //DEBUG(dbgs() << "found matching instructions " << *vi0 << " " << *vi1 << "\n");
 	    
-	    if (Instruction * gep0 = dyn_cast<GetElementPtrInst>(v0)) {
-	      if (Instruction * gep1 = dyn_cast<GetElementPtrInst>(v1)) {
-		//DEBUG(dbgs() << "found GEPs " << *gep0 << " " << *gep1 << "\n");
-		//DEBUG(dbgs() << "ops " << *gep0->getOperand(1) << " " << *gep1->getOperand(1) << "\n");
-		if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
-		  if (ConstantInt * ci1 = dyn_cast<ConstantInt>(gep1->getOperand(1))) {
-		    int64_t off0 = ci0->getZExtValue();
-		    int64_t off1 = ci1->getZExtValue();
-		    //DEBUG(dbgs() << "found Ints " << off0 << " " << off1 << "\n");
-		    if (offset_set) {
-		      if ( off0-off1 != offset && off0-off1 != 0 ) {
-			DEBUG(dbgs() << "found non-matching offsets " << off0 << " " << off1 << "\n");
-			mismatch = true;
+	      if (Instruction * gep0 = dyn_cast<GetElementPtrInst>(v0)) {
+		if (Instruction * gep1 = dyn_cast<GetElementPtrInst>(v1)) {
+		  //DEBUG(dbgs() << "found GEPs " << *gep0 << " " << *gep1 << "\n");
+		  //DEBUG(dbgs() << "ops " << *gep0->getOperand(1) << " " << *gep1->getOperand(1) << "\n");
+		  if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
+		    if (ConstantInt * ci1 = dyn_cast<ConstantInt>(gep1->getOperand(1))) {
+		      int64_t off0 = ci0->getZExtValue();
+		      int64_t off1 = ci1->getZExtValue();
+		      //DEBUG(dbgs() << "found Ints " << off0 << " " << off1 << "\n");
+		      if (offset_set) {
+			if ( off0-off1 != offset && off0-off1 != 0 ) {
+			  DEBUG(dbgs() << "found non-matching offsets " << off0 << " " << off1 << "\n");
+			  mismatch = true;
+			}
+		      } else {
+			offset = off0 - off1;
+			offset_set = true;
+			//DEBUG(dbgs() << "found offsets " << off0 << " " << off1 << "\n");
 		      }
-		    } else {
-		      offset = off0 - off1;
-		      offset_set = true;
-		      DEBUG(dbgs() << "found matching offsets " << off0 << " " << off1 << "\n");
 		    }
 		  }
 		}
 	      }
-	    }
 
-	    for (Use& U0 : vi0->operands()) {
-	      cmp0_visit.insert(U0.get());
-	    }
-	    for (Use& U1 : vi1->operands()) {
-	      cmp1_visit.insert(U1.get());
-	    }
-	    if (cmp0_visit.size() != cmp1_visit.size())
+	      for (Use& U0 : vi0->operands()) {
+		cmp0_visit.insert(U0.get());
+	      }
+	      for (Use& U1 : vi1->operands()) {
+		cmp1_visit.insert(U1.get());
+	      }
+	      if (cmp0_visit.size() != cmp1_visit.size()) {
+		DEBUG(dbgs() << "found mismatching number of operands " << cmp0_visit.size() << " " << cmp1_visit.size() << "\n");
+		mismatch=true;
+	      }
+	    } else {
+	      DEBUG(dbgs() << "found mismatching opcode" << *vi0 << " " << *vi1 << "\n");
 	      mismatch=true;
+	    }
 	  } else {
-	    DEBUG(dbgs() << "found mismatching opcode" << *vi0 << " " << *vi1 << "\n");
 	    mismatch=true;
+	    // v1 is not an instruction
 	  }
-	} else {
-	  mismatch=true;
-	  // v1 is not an instruction
 	}
       }
     }
+    if (!mismatch) {
+      DEBUG(dbgs() << " -> use_set matches, add offset " << offset << "\n");
+      cur_reduction->offsets.push_back( offset );
+      reduction_found = true;
+      break;
+    } 
   }
-  if (!mismatch) {
-    DEBUG(dbgs() << "use_set matches!" << "\n");
-    cur_reduction.offsets.push_back( offset );
+
+  if (reduction_found)
     return true;
-  } else {
-    DEBUG(dbgs() << "use_set doesn't match! Will add another reduction" << "\n");
-    reductions.push_back( reduction() );
-    reductions.back().instructions.insert( set.begin() , set.end() );
-    reductions.back().offsets.push_back(0);
-    return false;
-  }
+
+  DEBUG(dbgs() << "use_set doesn't match! Will add another reduction" << "\n");
+  reductions.push_back( reduction() );
+  reductions.back().instructions.insert( set.begin() , set.end() );
+  reductions.back().offsets.push_back(0);
+  reductions.back().id = id++;
+  return false;
 }
+
 
 
 
@@ -368,7 +420,7 @@ void qdp_jit_roll::modify_loop_body( reduction& red , Value* ind_var , int64_t o
 	int64_t off0 = ci0->getZExtValue();
 	int64_t off_new = off0 + offset_normalize;
 	if (off_new) {
-	  DEBUG(dbgs() << "Change offset " << off0 << " to " << off_new << "\n");
+	  //DEBUG(dbgs() << "Change offset " << off0 << " to " << off_new << "\n");
 	  Builder->SetInsertPoint(gep0);
 	  Value *new_gep_address = Builder->CreateAdd( ind_var , 
 						       ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
@@ -381,6 +433,115 @@ void qdp_jit_roll::modify_loop_body( reduction& red , Value* ind_var , int64_t o
     }
   }
 }
+
+
+
+bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* successor)
+{
+  auto offset_max = max_element(std::begin(cur->offsets), std::end(cur->offsets));
+  auto offset_min = min_element(std::begin(cur->offsets), std::end(cur->offsets));
+  auto offset_step = 0;
+
+  if (cur->offsets.size() > 1) {
+    offset_step = cur->offsets[1] - cur->offsets[0];
+      
+    for ( int64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
+      if (std::find(cur->offsets.begin(),cur->offsets.end(),i ) == cur->offsets.end()) {
+	DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
+	DEBUG(dbgs() << "Iteration " << i << " not found! Can't roll code into a loop.\n");
+	return false;
+      }
+    }
+  }
+
+  DEBUG(dbgs() 
+	<< "Loop rolling is possible with: min = " << *offset_min 
+	<< "   max = " << *offset_max 
+	<< "  step = " << offset_step << "\n");  
+    
+  llvm::BasicBlock *BBe = llvm::BasicBlock::Create(llvm::getGlobalContext(), "exit_loop" );
+  F->getBasicBlockList().push_front(BBe);
+
+  llvm::BasicBlock *BBl = llvm::BasicBlock::Create(llvm::getGlobalContext(), "loop" );
+  F->getBasicBlockList().push_front(BBl);
+
+  llvm::BasicBlock *BB0 = llvm::BasicBlock::Create(llvm::getGlobalContext(), "pre_loop" );
+  F->getBasicBlockList().push_front(BB0);
+
+  Builder->SetInsertPoint(BBe);
+  Builder->CreateBr(successor);
+
+  Builder->SetInsertPoint(BB0);
+  Builder->CreateBr(BBl);
+
+  //Builder->SetInsertPoint(&BB,BB.begin());
+  Builder->SetInsertPoint(BBl);
+  PHINode * PN = Builder->CreatePHI( Type::getIntNTy(getGlobalContext(),64) , 2 );
+
+  BasicBlock::iterator inst_set_begin;
+  bool notfound = true;
+  for (inst_set_begin = successor->begin() ; inst_set_begin != successor->end() ; ++inst_set_begin ) {
+    if (cur->instructions.count(inst_set_begin)) {
+      notfound = false;
+      break;
+    }
+  }
+  if (notfound) {
+    DEBUG(dbgs() << "Could not find any instruction in the basic block that is also in the current set.\n" );    
+    return false;
+  }
+  BasicBlock::iterator inst_set_end;
+  for (inst_set_end = inst_set_begin ; inst_set_end != successor->end() ; ++inst_set_end ) {
+    if (!cur->instructions.count(inst_set_end)) {
+      break;
+    }
+  }
+  //successor->dump();
+  DEBUG(dbgs() << "Using the following enclosing instructions\n" );    
+  DEBUG(dbgs() << *inst_set_begin << "\n" );
+  DEBUG(dbgs() << *inst_set_end << "\n" );
+
+#if 0
+  for (BasicBlock::iterator inst = successor->begin() ;
+       inst != successor->end() ;
+       ++inst ) {
+    if (Instruction *Inst = dyn_cast<Instruction>(inst)) {
+      if (cur->instructions.count(Inst)) {
+	Inst->removeFromParent();
+	Builder->Insert(Inst);
+      }
+    }
+  }
+#endif
+
+  // for ( Value* v: cur->instructions ) {
+  //   if (Instruction *Inst = dyn_cast<Instruction>(v)) {
+  //     Inst->removeFromParent();
+  //     Builder->Insert(Inst);
+  //   }
+  // }
+
+  //Builder->SetInsertPoint(&BB,BB.end());
+
+  Value *PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , offset_step ) );
+  Value *cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_max ) );
+
+  PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_min ) , BB0 );
+  PN->addIncoming( PNp1 , BBl );
+
+  Builder->CreateCondBr( cond , BBe, BBl);
+
+  BBl->getInstList().splice( cast<Instruction>(PNp1) , successor->getInstList() , inst_set_begin , inst_set_end );
+
+  modify_loop_body( *cur , PN , 0 );
+
+  DEBUG(dbgs() << "Latch after splice & modify:\n" );    
+  BBl->dump();
+
+
+  return true;
+}
+
 
 
 
@@ -401,99 +562,179 @@ bool qdp_jit_roll::runOnFunction(Function &F) {
   SetVector<Value*> processed;
   SetVector<Value*> for_erasure;
 
-
+#ifndef NDEBUG	
+  bool first_set = true;
+#endif
+  int marked_erasure = 0;
   for (Instruction& I : BB) {
     if (isa<StoreInst>(I)) {
       if (processed.count( &I ) == 0 ) {
-	DEBUG(dbgs() << "Found new StoreInst " << I << "\n");
+
+#ifndef NDEBUG
+	std::stringstream ss;
+	std::string str;
+	llvm::raw_string_ostream rso(str);
+#endif
+	DEBUG(rso << "Found new StoreInst ");
+	DEBUG(I.print(rso));
+	DEBUG(rso << "\n");
+
 	collectRoots(I, all_roots);
-	DEBUG(dbgs() << "Number of roots found " << all_roots.size() << "\n");
+	DEBUG(rso << "Root instructions                        = " << all_roots.size() << "\n");
+
 	SetVector<Value*> all_uses;
 	collectAllUses(all_roots,all_uses);      
-	collectForStoresAllOperandsAll(all_uses);
+	DEBUG(rso << "Uses (of the roots)                      = " << all_uses.size() << "\n");
 
-	DEBUG(dbgs() << "Number of all uses " << all_uses.size() << "\n");
+	collectForStoresAllOperandsAll(all_uses);
+	DEBUG(rso << "Uses (incl. from other reachable stores) = " << all_uses.size() << "\n");
+
+
+#if 0
 	for (Value *v : all_uses)
 	  DEBUG(dbgs() << *v << "\n");
+#endif
 
 	if (track(all_uses)) {
 	  for_erasure.insert( all_uses.begin(), all_uses.end() );
-	  DEBUG(dbgs() << "Use set will be erased!" << "\n");
+	  marked_erasure++;
+	  //DEBUG(dbgs() << "Marked for erasure!" << "\n");
 	}
-	
+
+#ifndef NDEBUG	
+	if (first_set)
+	  dbgs() << rso.str();
+	first_set=false;
+#endif
 
 	processed.insert(all_uses.begin(),all_uses.end());
+
       } else {
-	DEBUG(dbgs() << "Found already processed StoreInst " << I << "\n");
-      }
-      // for (Use& U : I.operands()) {
-      // 	Value* V = U.get();
-      // 	if (dyn_cast<Instruction>(V)) {
-      // 	  DEBUG(dbgs() << "Found instruction " << *V << "\n");
-      // 	} else {
-      // 	  DEBUG(dbgs() << "Found operand " << *V << "\n");
-      // 	}
-      // }
-      //use_empty = " << I.use_empty() << "\n");
-    }
-  }
-
-  std::sort(reductions[0].offsets.begin(),reductions[0].offsets.end());
-  DEBUG(dbgs() << "All offsets:\n");
-  for ( auto offset : reductions[0].offsets ) {
-    DEBUG(dbgs() << offset << " ");
-  }
-  DEBUG(dbgs() << "\n");
-
-  auto offset_max = max_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
-  auto offset_min = min_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
-  auto offset_step = 0;
-  int64_t offset_normalize = 0;
-
-  if (*offset_min < 0) {
-    DEBUG(dbgs() << "Found negative offsets, will normalize!\n");
-    offset_normalize = *offset_min;
-    for ( auto& offset : reductions[0].offsets ) {
-      offset += offset_normalize;
-    }
-  }
-
-  if (reductions[0].offsets.size() > 1) {
-    offset_step = reductions[0].offsets[1] - reductions[0].offsets[0];
-
-    for ( int64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
-      if (std::find(reductions[0].offsets.begin(),reductions[0].offsets.end(),i ) == reductions[0].offsets.end()) {
-	DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
-	DEBUG(dbgs() << "Iteration " << i << " not found! Can't roll code into a loop.\n");
-	return false;
+	//DEBUG(dbgs() << "Found already processed StoreInst " << I << "\n");
       }
     }
   }
 
-  DEBUG(dbgs() 
-	<< "Loop rolling is possible with: min = " << *offset_min 
-	<< "   max = " << *offset_max 
-	<< "  step = " << offset_step << "\n");  
+  DEBUG(dbgs() << "Total instructions processed        = " << processed.size() << "\n");
+  DEBUG(dbgs() << "Instruction sets marked for erasure = " << marked_erasure << "\n");
 
 
+  DEBUG(dbgs() << "Erasing instruction count = " << for_erasure.size() << "\n");
   for ( Value* v: for_erasure ) {
     if (Instruction *Inst = dyn_cast<Instruction>(v)) {
-      DEBUG(dbgs() << "erasure: " << *Inst << "\n");
+      //DEBUG(dbgs() << "erasure: " << *Inst << "\n");
       if (!Inst->use_empty())
 	Inst->replaceAllUsesWith(UndefValue::get(Inst->getType()));
       Inst->eraseFromParent();
     }
   }
 
-  ReturnInst* RI;
+
+  int i=0;
+  DEBUG(dbgs() << "Number of reductions = " << reductions.size() << "\n");
+  for (reductions_t::iterator cur_reduction = reductions.begin();
+       cur_reduction != reductions.end(); 
+       ++cur_reduction,++i ) {
+    DEBUG(dbgs() << "All offsets for reduction " << i << ": ");
+    if (cur_reduction->offsets.size() > 24) {
+      DEBUG(dbgs() << cur_reduction->offsets[0] << " ");
+      DEBUG(dbgs() << cur_reduction->offsets[1] << " ");
+      DEBUG(dbgs() << " ... ");
+      DEBUG(dbgs() << cur_reduction->offsets[cur_reduction->offsets.size()-2] << " ");
+      DEBUG(dbgs() << cur_reduction->offsets[cur_reduction->offsets.size()-1] << " ");
+    } else {
+      for ( auto offset : cur_reduction->offsets ) {
+	DEBUG(dbgs() << offset << " ");
+      }
+    }
+    DEBUG(dbgs() << "\n");
+  }
+
+  for (reductions_t::iterator cur_reduction = reductions.begin();
+       cur_reduction != reductions.end(); 
+       ++cur_reduction ) {
+    // Insert a loop into the function body
+    //insert_loop(cur_reduction,&F,&BB);
+  }
+
+  //  F.dump();
+
+
+#if 0
+    std::sort(reductions[0].offsets.begin(),reductions[0].offsets.end());
+
+    DEBUG(dbgs() << "All offsets:\n");
+    if (reductions[0].offsets.size() > 4) {
+      DEBUG(dbgs() << reductions[0].offsets[0] << " ");
+      DEBUG(dbgs() << reductions[0].offsets[1] << " ");
+      DEBUG(dbgs() << " ... ");
+      DEBUG(dbgs() << reductions[0].offsets[reductions[0].offsets.size()-2] << " ");
+      DEBUG(dbgs() << reductions[0].offsets[reductions[0].offsets.size()-1] << " ");
+    } else {
+      for ( auto offset : reductions[0].offsets ) {
+	DEBUG(dbgs() << offset << " ");
+      }
+    }
+    DEBUG(dbgs() << "\n");
+
+
+    auto offset_max = max_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
+    auto offset_min = min_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
+    auto offset_step = 0;
+    int64_t offset_normalize = 0;
+    
+    if (*offset_min < 0) {
+      DEBUG(dbgs() << "Found negative offsets, will normalize!\n");
+      offset_normalize = *offset_min;
+      for ( auto& offset : reductions[0].offsets ) {
+	offset += offset_normalize;
+      }
+    }
+
+    if (reductions[0].offsets.size() > 1) {
+      offset_step = reductions[0].offsets[1] - reductions[0].offsets[0];
+      
+      for ( int64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
+	if (std::find(reductions[0].offsets.begin(),reductions[0].offsets.end(),i ) == reductions[0].offsets.end()) {
+	  DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
+	  DEBUG(dbgs() << "Iteration " << i << " not found! Can't roll code into a loop.\n");
+	  return false;
+	}
+      }
+    }
+
+    DEBUG(dbgs() 
+	  << "Loop rolling is possible with: min = " << *offset_min 
+	  << "   max = " << *offset_max 
+	  << "  step = " << offset_step << "\n");  
+
+  // ReturnInst* RI = NULL;
+  // for (Instruction& I : BB) {
+  //   if (ReturnInst* RI0 = dyn_cast<ReturnInst>(&I)) {
+  //     RI = RI0;
+  //     //DEBUG(dbgs() << "found ret " << *RI << "\n");
+  //   }
+  // }
+  // if (!RI) {
+  //   DEBUG(dbgs() << "Panic! No return instruction found!" << "\n");
+  // }
+  // RI->eraseFromParent();
+  // //DEBUG(dbgs() << "done removing " << "\n");
+
+    
+
+  ReturnInst* RI = NULL;
   for (Instruction& I : BB) {
     if (ReturnInst* RI0 = dyn_cast<ReturnInst>(&I)) {
       RI = RI0;
-      DEBUG(dbgs() << "found ret " << *RI << "\n");
+      //DEBUG(dbgs() << "found ret " << *RI << "\n");
     }
   }
+  if (!RI) {
+    DEBUG(dbgs() << "Panic! No return instruction found!" << "\n");
+  }
   RI->eraseFromParent();
-  DEBUG(dbgs() << "done removing " << "\n");
+  //DEBUG(dbgs() << "done removing " << "\n");
 
   llvm::BasicBlock *BB0 = llvm::BasicBlock::Create(llvm::getGlobalContext(), "pre_loop" );
   F.getBasicBlockList().push_front(BB0);
@@ -501,7 +742,7 @@ bool qdp_jit_roll::runOnFunction(Function &F) {
   llvm::BasicBlock *BBe = llvm::BasicBlock::Create(llvm::getGlobalContext(), "exit_loop" );
   F.getBasicBlockList().push_back(BBe);
   Builder->SetInsertPoint(BBe);
-  Builder->CreateRetVoid();
+  //Builder->CreateRetVoid();
 
   Builder->SetInsertPoint(BB0);
   Builder->CreateBr(&BB);
@@ -523,11 +764,9 @@ bool qdp_jit_roll::runOnFunction(Function &F) {
   modify_loop_body( reductions[0] , PN , offset_normalize );
 
 
-  F.dump();
-
   //AA = &getAnalysis<AliasAnalysis>();
 
-
+#endif
   return true;
 }
 
