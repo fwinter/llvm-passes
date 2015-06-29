@@ -19,10 +19,13 @@
 //#include "llvm/Analysis/AliasSetTracker.h"
 #include "llvm/Analysis/TargetFolder.h"
 #include "llvm/Pass.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -43,25 +46,26 @@ using namespace llvm;
 namespace {
 
 
-class qdp_jit_roll : public FunctionPass {
+class qdp_jit_roll : public ModulePass {
 public:
   const char *getPassName() const override { return "qdp_jit_roll"; }
   static char ID;
 
   qdp_jit_roll()
-      : FunctionPass(ID),
+      : ModulePass(ID),
         C(nullptr), DL(nullptr) {
     initializeSROAPass(*PassRegistry::getPassRegistry());
   }
   
   //  using llvm::Pass::doInitialization;
   //bool doInitialization(Function &) override;
-  bool runOnFunction(Function &F) override;
+  //bool runOnFunction(Function &F) override;
+  bool runOnModule(Module &M) override;
 
 protected:
   struct reduction {
     SetVector<Value*> instructions;
-    std::vector<int64_t> offsets;
+    std::vector<uint64_t> offsets;
     int id;
   };
   typedef std::vector<reduction> reductions_t;
@@ -82,6 +86,7 @@ protected:
 private:
   reductions_t reductions;
 
+  Module* module;
   typedef IRBuilder<true, TargetFolder> BuilderTy;
   LLVMContext *C;
   const DataLayout *DL;
@@ -391,6 +396,10 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
       }
     }
     if (!mismatch) {
+      if (offset < 0) {
+	DEBUG(dbgs() << "found a negative offset " << offset << ". That's not supported\n");
+	exit(0);
+      }
       DEBUG(dbgs() << " -> use_set matches, add offset " << offset << "\n");
       cur_reduction->offsets.push_back( offset );
       reduction_found = true;
@@ -442,17 +451,32 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
   auto offset_min = min_element(std::begin(cur->offsets), std::end(cur->offsets));
   auto offset_step = 0;
 
+  
+  bool constant_stride=true;
+  uint64_t loop_count;
+  GlobalVariable* offset_var;
+
   if (cur->offsets.size() > 1) {
     offset_step = cur->offsets[1] - cur->offsets[0];
       
-    for ( int64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
+    for ( uint64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
       if (std::find(cur->offsets.begin(),cur->offsets.end(),i ) == cur->offsets.end()) {
 	DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
-	DEBUG(dbgs() << "Iteration " << i << " not found! Can't roll code into a loop.\n");
-	return false;
+	DEBUG(dbgs() << "Iteration " << i << " not found! Must use and offset array.\n");
+	Constant* CDA = ConstantDataArray::get( llvm::getGlobalContext() , 
+						ArrayRef<uint64_t>( cur->offsets.data() , cur->offsets.size() ) );
+	ArrayType *array_type = ArrayType::get( Type::getIntNTy(getGlobalContext(),64) , cur->offsets.size() );
+
+	offset_var = new GlobalVariable(*module, array_type , true, GlobalValue::InternalLinkage, CDA , "offset_array" );
+
+	constant_stride = false;
+	loop_count = cur->offsets.size();
+
+	break;
       }
     }
   }
+
 
   DEBUG(dbgs() 
 	<< "Loop rolling is possible with: min = " << *offset_min 
@@ -501,43 +525,40 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
   DEBUG(dbgs() << *inst_set_begin << "\n" );
   DEBUG(dbgs() << *inst_set_end << "\n" );
 
-#if 0
-  for (BasicBlock::iterator inst = successor->begin() ;
-       inst != successor->end() ;
-       ++inst ) {
-    if (Instruction *Inst = dyn_cast<Instruction>(inst)) {
-      if (cur->instructions.count(Inst)) {
-	Inst->removeFromParent();
-	Builder->Insert(Inst);
-      }
-    }
+
+  Value *cond;
+  Value *PNp1;
+  Value * offset_read;
+  if (constant_stride) {
+    PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , offset_step ) );
+    cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_max ) );
+    PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_min ) , BB0 );
+    PN->addIncoming( PNp1 , BBl );
+  } else {
+    std::vector<Value*> tmp;
+    tmp.push_back( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) );
+    tmp.push_back( PN );
+    Value* offset_GEP = Builder->CreateGEP( offset_var , ArrayRef<Value*>(tmp) );
+    offset_read = Builder->CreateLoad( offset_GEP );
+
+    PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 1 ) );
+    cond = Builder->CreateICmpUGE( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , loop_count ) );
+    PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) , BB0 );
+    PN->addIncoming( PNp1 , BBl );
   }
-#endif
-
-  // for ( Value* v: cur->instructions ) {
-  //   if (Instruction *Inst = dyn_cast<Instruction>(v)) {
-  //     Inst->removeFromParent();
-  //     Builder->Insert(Inst);
-  //   }
-  // }
-
-  //Builder->SetInsertPoint(&BB,BB.end());
-
-  Value *PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , offset_step ) );
-  Value *cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_max ) );
-
-  PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_min ) , BB0 );
-  PN->addIncoming( PNp1 , BBl );
 
   Builder->CreateCondBr( cond , BBe, BBl);
 
   BBl->getInstList().splice( cast<Instruction>(PNp1) , successor->getInstList() , inst_set_begin , inst_set_end );
 
-  modify_loop_body( *cur , PN , 0 );
+  if (constant_stride) {
+    modify_loop_body( *cur , PN , 0 );
+  } else {
+    modify_loop_body( *cur , offset_read , 0 );
+  }
 
   DEBUG(dbgs() << "Latch after splice & modify:\n" );    
   BBl->dump();
-
 
   return true;
 }
@@ -545,16 +566,30 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
 
 
 
-bool qdp_jit_roll::runOnFunction(Function &F) {
+bool qdp_jit_roll::runOnModule(Module &M) {
+  module = &M;
+  IRBuilder<true, TargetFolder> TheBuilder(M.getContext(), TargetFolder(DL));
+  Builder = &TheBuilder;
+
+  Function* F_ptr = NULL;
+  for( Module::iterator MI = M.begin(), ME = M.end();
+       MI != ME; ++MI ) {
+    if (MI->getName() == "main") {
+      F_ptr = MI;
+    }
+  }
+  if (!F_ptr) {
+    DEBUG(dbgs() << "No function with name 'main' found. Giving up."  << "\n");
+    return false;
+  }
+
+  Function& F = *F_ptr;
+
+  
+#if 1
   DEBUG(dbgs() << "Running on F"  << "\n");
 
   BasicBlock& BB = F.getEntryBlock();
-
-  IRBuilder<true, TargetFolder> TheBuilder(BB.getContext(), TargetFolder(DL));
-  Builder = &TheBuilder;
-
-  if (skipOptnoneFunction(F))
-    return false;
 
   add_GEPs(BB);
 
@@ -651,10 +686,10 @@ bool qdp_jit_roll::runOnFunction(Function &F) {
   }
 
   for (reductions_t::iterator cur_reduction = reductions.begin();
-       cur_reduction != reductions.end(); 
+       cur_reduction != reductions.end();
        ++cur_reduction ) {
     // Insert a loop into the function body
-    //insert_loop(cur_reduction,&F,&BB);
+    insert_loop(cur_reduction,&F,&BB);
   }
 
   //  F.dump();
@@ -767,6 +802,7 @@ bool qdp_jit_roll::runOnFunction(Function &F) {
   //AA = &getAnalysis<AliasAnalysis>();
 
 #endif
+#endif
   return true;
 }
 
@@ -784,7 +820,7 @@ char qdp_jit_roll::ID = 0;
 static RegisterPass<qdp_jit_roll> X("qdp_jit_roll", "QDP-JIT roll linear code into loop");
 
 
-FunctionPass *llvm::create_qdp_jit_roll_pass() {
+ModulePass *llvm::create_qdp_jit_roll_pass() {
   return new qdp_jit_roll();
 }
 
