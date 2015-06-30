@@ -1,0 +1,27 @@
+Index: lib/Transforms/LLVMBuild.txt
+===================================================================
+Index: include/llvm/Transforms/Scalar.h
+===================================================================
+18a19
+> #include "llvm/Pass.h"
+406a408,412
+> 
+> 
+>   ModulePass *create_qdp_jit_roll_pass();
+> 
+> 
+Index: include/llvm/Transforms/Vectorize.h
+===================================================================
+141a142,143
+> 
+> 
+Index: include/llvm/InitializePasses.h
+===================================================================
+289a290
+> void initializeqdp_jit_rollPass(PassRegistry&);
+Index: include/llvm/LinkAllPasses.h
+===================================================================
+169c169
+< 
+---
+>       (void) llvm::create_qdp_jit_roll_pass();
