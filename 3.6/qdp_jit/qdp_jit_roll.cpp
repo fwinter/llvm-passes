@@ -78,7 +78,8 @@ protected:
   void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
   bool track( SetVector<Value*>& set);
   void modify_loop_body( reduction& red , Value* ind_var , int64_t offset_normalize );
-  bool insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* successor);
+  //bool insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* successor);
+  BasicBlock* insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* insert_before,BasicBlock* take_instr_from);
   //void getAnalysisUsage(AnalysisUsage &AU) const override;
 
 
@@ -444,8 +445,10 @@ void qdp_jit_roll::modify_loop_body( reduction& red , Value* ind_var , int64_t o
 }
 
 
-
-bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* successor)
+//
+// returns the block (loop start) that was inserted
+//
+BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* insert_before,BasicBlock* take_instr_from)
 {
   auto offset_max = max_element(std::begin(cur->offsets), std::end(cur->offsets));
   auto offset_min = min_element(std::begin(cur->offsets), std::end(cur->offsets));
@@ -493,7 +496,7 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
   F->getBasicBlockList().push_front(BB0);
 
   Builder->SetInsertPoint(BBe);
-  Builder->CreateBr(successor);
+  Builder->CreateBr(insert_before);
 
   Builder->SetInsertPoint(BB0);
   Builder->CreateBr(BBl);
@@ -504,7 +507,7 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
 
   BasicBlock::iterator inst_set_begin;
   bool notfound = true;
-  for (inst_set_begin = successor->begin() ; inst_set_begin != successor->end() ; ++inst_set_begin ) {
+  for (inst_set_begin = take_instr_from->begin() ; inst_set_begin != take_instr_from->end() ; ++inst_set_begin ) {
     if (cur->instructions.count(inst_set_begin)) {
       notfound = false;
       break;
@@ -512,10 +515,10 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
   }
   if (notfound) {
     DEBUG(dbgs() << "Could not find any instruction in the basic block that is also in the current set.\n" );    
-    return false;
+    return NULL;
   }
   BasicBlock::iterator inst_set_end;
-  for (inst_set_end = inst_set_begin ; inst_set_end != successor->end() ; ++inst_set_end ) {
+  for (inst_set_end = inst_set_begin ; inst_set_end != take_instr_from->end() ; ++inst_set_end ) {
     if (!cur->instructions.count(inst_set_end)) {
       break;
     }
@@ -549,7 +552,7 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
 
   Builder->CreateCondBr( cond , BBe, BBl);
 
-  BBl->getInstList().splice( cast<Instruction>(PNp1) , successor->getInstList() , inst_set_begin , inst_set_end );
+  BBl->getInstList().splice( cast<Instruction>(PNp1) , take_instr_from->getInstList() , inst_set_begin , inst_set_end );
 
   if (constant_stride) {
     modify_loop_body( *cur , PN , 0 );
@@ -560,7 +563,7 @@ bool qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicB
   DEBUG(dbgs() << "Latch after splice & modify:\n" );    
   BBl->dump();
 
-  return true;
+  return BB0;
 }
 
 
@@ -574,8 +577,10 @@ bool qdp_jit_roll::runOnModule(Module &M) {
   Function* F_ptr = NULL;
   for( Module::iterator MI = M.begin(), ME = M.end();
        MI != ME; ++MI ) {
-    if (MI->getName() == "main") {
-      F_ptr = MI;
+    if (Function* F0 = dyn_cast<Function>(MI)) {
+      if (F0->getName() == "main") {
+	F_ptr = MI;
+      }
     }
   }
   if (!F_ptr) {
@@ -685,123 +690,15 @@ bool qdp_jit_roll::runOnModule(Module &M) {
     DEBUG(dbgs() << "\n");
   }
 
+  BasicBlock* insert_before = &BB;
   for (reductions_t::iterator cur_reduction = reductions.begin();
        cur_reduction != reductions.end();
        ++cur_reduction ) {
     // Insert a loop into the function body
-    insert_loop(cur_reduction,&F,&BB);
+    insert_before = insert_loop( cur_reduction , &F , insert_before , &BB );
   }
 
   //  F.dump();
-
-
-#if 0
-    std::sort(reductions[0].offsets.begin(),reductions[0].offsets.end());
-
-    DEBUG(dbgs() << "All offsets:\n");
-    if (reductions[0].offsets.size() > 4) {
-      DEBUG(dbgs() << reductions[0].offsets[0] << " ");
-      DEBUG(dbgs() << reductions[0].offsets[1] << " ");
-      DEBUG(dbgs() << " ... ");
-      DEBUG(dbgs() << reductions[0].offsets[reductions[0].offsets.size()-2] << " ");
-      DEBUG(dbgs() << reductions[0].offsets[reductions[0].offsets.size()-1] << " ");
-    } else {
-      for ( auto offset : reductions[0].offsets ) {
-	DEBUG(dbgs() << offset << " ");
-      }
-    }
-    DEBUG(dbgs() << "\n");
-
-
-    auto offset_max = max_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
-    auto offset_min = min_element(std::begin(reductions[0].offsets), std::end(reductions[0].offsets));
-    auto offset_step = 0;
-    int64_t offset_normalize = 0;
-    
-    if (*offset_min < 0) {
-      DEBUG(dbgs() << "Found negative offsets, will normalize!\n");
-      offset_normalize = *offset_min;
-      for ( auto& offset : reductions[0].offsets ) {
-	offset += offset_normalize;
-      }
-    }
-
-    if (reductions[0].offsets.size() > 1) {
-      offset_step = reductions[0].offsets[1] - reductions[0].offsets[0];
-      
-      for ( int64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
-	if (std::find(reductions[0].offsets.begin(),reductions[0].offsets.end(),i ) == reductions[0].offsets.end()) {
-	  DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
-	  DEBUG(dbgs() << "Iteration " << i << " not found! Can't roll code into a loop.\n");
-	  return false;
-	}
-      }
-    }
-
-    DEBUG(dbgs() 
-	  << "Loop rolling is possible with: min = " << *offset_min 
-	  << "   max = " << *offset_max 
-	  << "  step = " << offset_step << "\n");  
-
-  // ReturnInst* RI = NULL;
-  // for (Instruction& I : BB) {
-  //   if (ReturnInst* RI0 = dyn_cast<ReturnInst>(&I)) {
-  //     RI = RI0;
-  //     //DEBUG(dbgs() << "found ret " << *RI << "\n");
-  //   }
-  // }
-  // if (!RI) {
-  //   DEBUG(dbgs() << "Panic! No return instruction found!" << "\n");
-  // }
-  // RI->eraseFromParent();
-  // //DEBUG(dbgs() << "done removing " << "\n");
-
-    
-
-  ReturnInst* RI = NULL;
-  for (Instruction& I : BB) {
-    if (ReturnInst* RI0 = dyn_cast<ReturnInst>(&I)) {
-      RI = RI0;
-      //DEBUG(dbgs() << "found ret " << *RI << "\n");
-    }
-  }
-  if (!RI) {
-    DEBUG(dbgs() << "Panic! No return instruction found!" << "\n");
-  }
-  RI->eraseFromParent();
-  //DEBUG(dbgs() << "done removing " << "\n");
-
-  llvm::BasicBlock *BB0 = llvm::BasicBlock::Create(llvm::getGlobalContext(), "pre_loop" );
-  F.getBasicBlockList().push_front(BB0);
-
-  llvm::BasicBlock *BBe = llvm::BasicBlock::Create(llvm::getGlobalContext(), "exit_loop" );
-  F.getBasicBlockList().push_back(BBe);
-  Builder->SetInsertPoint(BBe);
-  //Builder->CreateRetVoid();
-
-  Builder->SetInsertPoint(BB0);
-  Builder->CreateBr(&BB);
-
-  Builder->SetInsertPoint(&BB,BB.begin());
-  PHINode * PN = Builder->CreatePHI( Type::getIntNTy(getGlobalContext(),64) , 2 );
-
-  Builder->SetInsertPoint(&BB,BB.end());
-
-  Value *PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , offset_step ) );
-  Value *cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_max ) );
-
-  PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_min ) , BB0 );
-  PN->addIncoming( PNp1 , &BB );
-
-  Builder->CreateCondBr( cond , BBe, &BB);
-  
-
-  modify_loop_body( reductions[0] , PN , offset_normalize );
-
-
-  //AA = &getAnalysis<AliasAnalysis>();
-
-#endif
 #endif
   return true;
 }
