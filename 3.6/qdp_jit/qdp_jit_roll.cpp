@@ -481,10 +481,14 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   }
 
 
+  if (constant_stride) {
   DEBUG(dbgs() 
 	<< "Loop rolling is possible with: min = " << *offset_min 
 	<< "   max = " << *offset_max 
 	<< "  step = " << offset_step << "\n");  
+  } else {
+    DEBUG(dbgs() << "Loop rolling is possible offset array and loop count = " << loop_count << "\n");
+  }
     
   llvm::BasicBlock *BBe = llvm::BasicBlock::Create(llvm::getGlobalContext(), "exit_loop" );
   F->getBasicBlockList().push_front(BBe);
@@ -505,28 +509,16 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   Builder->SetInsertPoint(BBl);
   PHINode * PN = Builder->CreatePHI( Type::getIntNTy(getGlobalContext(),64) , 2 );
 
-  BasicBlock::iterator inst_set_begin;
-  bool notfound = true;
-  for (inst_set_begin = take_instr_from->begin() ; inst_set_begin != take_instr_from->end() ; ++inst_set_begin ) {
-    if (cur->instructions.count(inst_set_begin)) {
-      notfound = false;
-      break;
-    }
-  }
-  if (notfound) {
-    DEBUG(dbgs() << "Could not find any instruction in the basic block that is also in the current set.\n" );    
-    return NULL;
-  }
-  BasicBlock::iterator inst_set_end;
-  for (inst_set_end = inst_set_begin ; inst_set_end != take_instr_from->end() ; ++inst_set_end ) {
-    if (!cur->instructions.count(inst_set_end)) {
-      break;
-    }
-  }
-  //successor->dump();
-  DEBUG(dbgs() << "Using the following enclosing instructions\n" );    
-  DEBUG(dbgs() << *inst_set_begin << "\n" );
-  DEBUG(dbgs() << *inst_set_end << "\n" );
+  
+  // DEBUG( dbgs() << "Current instructions:\n" );
+  // for ( Value* v : cur->instructions ) {
+  //   DEBUG( dbgs() << *v << "\n" );
+  // }
+  // DEBUG( dbgs() << "--------------------\n" );
+
+  // take_instr_from->dump();
+  // DEBUG( dbgs() << "--------------------\n" );
+
 
 
   Value *cond;
@@ -552,7 +544,59 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
 
   Builder->CreateCondBr( cond , BBe, BBl);
 
-  BBl->getInstList().splice( cast<Instruction>(PNp1) , take_instr_from->getInstList() , inst_set_begin , inst_set_end );
+#if 0
+    BasicBlock::iterator inst_set_begin;
+    bool notfound = true;
+    for (inst_set_begin = take_instr_from->begin() ; inst_set_begin != take_instr_from->end() ; ++inst_set_begin ) {
+      if (cur->instructions.count(inst_set_begin)) {
+	notfound = false;
+	break;
+      }
+    }
+    if (notfound) {
+      DEBUG(dbgs() << "Could not find any instruction in the basic block that is also in the current set.\n" );    
+      return NULL;
+    }
+    BasicBlock::iterator inst_set_end;
+    for (inst_set_end = inst_set_begin ; inst_set_end != take_instr_from->end() ; ++inst_set_end ) {
+      if (!cur->instructions.count(inst_set_end)) {
+	break;
+      }
+    }
+    //successor->dump();
+    DEBUG(dbgs() << "Using the following enclosing instructions\n" );    
+    DEBUG(dbgs() << *inst_set_begin << "\n" );
+    DEBUG(dbgs() << *inst_set_end << "\n" );
+#endif
+
+  BasicBlock::iterator inst_search_start = take_instr_from->begin();
+  while(1) {
+    BasicBlock::iterator inst_set_begin;
+    bool notfound = true;
+    for (inst_set_begin = inst_search_start ; inst_set_begin != take_instr_from->end() ; ++inst_set_begin ) {
+      if (cur->instructions.count(inst_set_begin)) {
+	notfound = false;
+	break;
+      }
+    }
+    if (notfound) {
+      // we could be in a stream after a few hits
+      break;
+    }
+    BasicBlock::iterator inst_set_end;
+    for (inst_set_end = inst_set_begin ; inst_set_end != take_instr_from->end() ; ++inst_set_end ) {
+      if (!cur->instructions.count(inst_set_end)) {
+	break;
+      }
+    }
+    //successor->dump();
+    DEBUG(dbgs() << "Using the following enclosing instructions\n" );    
+    DEBUG(dbgs() << *inst_set_begin << "\n" );
+    DEBUG(dbgs() << *inst_set_end << "\n" );
+
+    BBl->getInstList().splice( cast<Instruction>(PNp1) , take_instr_from->getInstList() , inst_set_begin , inst_set_end );
+    inst_search_start = inst_set_end;
+  }
 
   if (constant_stride) {
     modify_loop_body( *cur , PN , 0 );
