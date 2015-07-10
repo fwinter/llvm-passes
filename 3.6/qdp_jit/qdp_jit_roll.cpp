@@ -38,7 +38,8 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "qdp_jit_roll"
+#define SV_NAME "qdp_jit_roll0"
+#define DEBUG_TYPE SV_NAME
 
 //STATISTIC(NumLoadsAnalyzed, "Number of loads analyzed for combining");
 //STATISTIC(NumLoadsCombined, "Number of loads combined");
@@ -54,7 +55,7 @@ public:
   qdp_jit_roll()
       : ModulePass(ID),
         C(nullptr), DL(nullptr) {
-    initializeSROAPass(*PassRegistry::getPassRegistry());
+    //initializeSROAPass(*PassRegistry::getPassRegistry());
   }
   
   //  using llvm::Pass::doInitialization;
@@ -758,7 +759,7 @@ bool qdp_jit_roll::runOnModule(Module &M) {
 
 
 char qdp_jit_roll::ID = 0;
-static RegisterPass<qdp_jit_roll> X("qdp_jit_roll", "QDP-JIT roll linear code into loop");
+static RegisterPass<qdp_jit_roll> X(SV_NAME, "QDP-JIT roll linear code into loop");
 
 
 ModulePass *llvm::create_qdp_jit_roll_pass() {
