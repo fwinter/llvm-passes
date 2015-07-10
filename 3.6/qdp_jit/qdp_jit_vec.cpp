@@ -72,10 +72,12 @@ protected:
   int vectorize_loads( std::vector<std::vector<Instruction*> >& load_instructions);
   void vectorize_all_uses( std::vector<Value*> vector_loads );
   void mark_for_erasure_all_operands(Value* V);
+  void move_inst_before(Instruction* to_move,Instruction* before);
 
 private:
   reductions_t reductions;
   SetVector<Value*> for_erasure;
+  Function* function;
 
   Module* module;
   typedef IRBuilder<true, TargetFolder> BuilderTy;
@@ -198,6 +200,21 @@ void qdp_jit_vec::vectorize_all_uses( std::vector<Value*> vector_loads )
 
 
 
+void qdp_jit_vec::move_inst_before(Instruction* to_move,Instruction* before)
+{
+  to_move->removeFromParent();
+  to_move->insertBefore(before);
+
+  for (Use& U : to_move->operands()) {
+    Value* Op = U.get();
+    if (Instruction* I = dyn_cast<Instruction>(Op)) {
+      I->removeFromParent();
+      I->insertBefore(to_move);
+    }
+  }
+}
+
+
 
 int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_instructions)
 {
@@ -206,9 +223,9 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
     return 0;
   int vec_len = load_instructions.at(0).size();
   int load_vec_elem = 0;
-  int loads_consec = true;
   for( std::vector<Instruction*>& VI : load_instructions ) {
     DEBUG(dbgs() << "Processing vector of loads number " << load_vec_elem++ << "\n");
+    int loads_consec = true;
     uint64_t lo,hi;
     GetElementPtrInst* first_GEP;
     bool first = true;
@@ -256,11 +273,78 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
 
       vector_loads.push_back( LI );
     } else {
-      DEBUG(dbgs() << "Loads not consecutive\n");
+      DEBUG(dbgs() << "Loads not consecutive:\n");
+      for (Value* V: VI) {
+	DEBUG(dbgs() << *V << "\n");
+      }
+
+      //Instruction* I = dyn_cast<Instruction>(VI.back()->getNextNode());
+      //DEBUG(dbgs() << *I << "\n");
+
+      Builder->SetInsertPoint( VI.at(0) );
+
+      VectorType *VecTy = VectorType::get( VI.at(0)->getType() , vec_len );
+      Value *Vec = UndefValue::get(VecTy);
+      int i=0;
+      bool first=true;
+      Value* first_insert;
+
+      for( Instruction* I : VI ) {
+	// Need to clone all but the first load, since they will be marked for erasure
+	if (i>0) {
+	  I = I->clone();
+	  Builder->GetInsertPoint()->insertBefore(I);
+	}
+	Vec = Builder->CreateInsertElement(Vec, I, Builder->getInt32(i++));
+	if (first) {
+	  first_insert=Vec;
+	  first=false;
+	}
+      }
+      for( Value* V : VI ) {
+	move_inst_before(cast<Instruction>(V),cast<Instruction>(first_insert));
+      }
+
+      Vec->mutateType( VI.at(0)->getType() );
+
+#if 1
+      for (Use &U : VI.at(0)->uses()) {
+      	Value* V = U.getUser();
+	if (Instruction* I = dyn_cast<Instruction>(V)) {
+	  if (!isa<InsertElementInst>(I)) {
+	    //DEBUG(dbgs() << "changing type of user " << *V << "\n");
+	    //V->mutateType(VecTy);
+	    DEBUG(dbgs() << "found user " << *V << "\n");
+	    int i=0;
+	    for (Use& U : I->operands()) {
+	      Value* Op = U.get();
+	      DEBUG(dbgs() << "found operand " << *Op << "\n");
+	      if (Op == VI.at(0)) {
+		DEBUG(dbgs() << "setting operand " << i << " to the vector insertelement\n");
+		I->setOperand( i , Vec );
+		//I->removeFromParent();
+		//I->insertAfter(cast<Instruction>(Vec));
+	      }
+	      i++;
+	    }
+	  }
+	}
+      }
+      //DEBUG(dbgs() << "Replace all uses of " << *VI.at(0) << " with\n");
+      //VI.at(0)->replaceAllUsesWith( Vec );
+      //DEBUG(dbgs() << "done: Replace all uses of with\n");
+#endif
+      Vec->mutateType( VecTy );
+      
+      vector_loads.push_back( Vec );
     }
   }
 
   vectorize_all_uses( vector_loads );
+
+  DEBUG(dbgs() << "----------------------------------------\n");
+  DEBUG(dbgs() << "After vectorize_loads\n");
+  function->dump();
 
   return 0;
 }
@@ -382,6 +466,7 @@ bool qdp_jit_vec::runOnFunction(Function &F) {
   Builder = &TheBuilder;
 
   BasicBlock& BB = F.getEntryBlock();
+  function = &F;
 
   Builder->SetInsertPoint(&BB,BB.begin());
 
@@ -408,6 +493,8 @@ bool qdp_jit_vec::runOnFunction(Function &F) {
       Inst->eraseFromParent();
     }
   }
+
+  function->dump();
 
   return true;
 }
