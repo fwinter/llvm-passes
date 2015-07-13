@@ -73,6 +73,7 @@ protected:
   void vectorize_all_uses( std::vector<Value*> vector_loads );
   void mark_for_erasure_all_operands(Value* V);
   void move_inst_before(Instruction* to_move,Instruction* before);
+  Instruction* clone_with_operands(Instruction* to_clone);
 
 private:
   reductions_t reductions;
@@ -215,6 +216,23 @@ void qdp_jit_vec::move_inst_before(Instruction* to_move,Instruction* before)
 }
 
 
+Instruction* qdp_jit_vec::clone_with_operands(Instruction* to_clone)
+{
+  Instruction* Icl = to_clone->clone();
+  Icl->insertBefore(to_clone);
+  
+  int i=0;
+  for (Use& U : to_clone->operands()) {
+    Value* Op = U.get();
+    if (Instruction* I = dyn_cast<Instruction>(Op)) {
+      Icl->setOperand( i , clone_with_operands( I ) );
+    }
+    i++;
+  }
+  return Icl;
+}
+
+
 
 int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_instructions)
 {
@@ -289,21 +307,34 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
       bool first=true;
       Value* first_insert;
 
+      std::vector<Instruction*> instruction_to_move_before_insertelement;
+
       for( Instruction* I : VI ) {
 	// Need to clone all but the first load, since they will be marked for erasure
 	if (i>0) {
-	  I = I->clone();
-	  Builder->GetInsertPoint()->insertBefore(I);
+	  //Instruction* Icl = I->clone();
+	  //DEBUG(dbgs() << "cloned: " << *I << "\n");
+	  //Icl->insertBefore(I);
+	  //DEBUG(dbgs() << "inserted: " << *Icl << "\n");
+	  Instruction* Icl = clone_with_operands(I);
+	  //DEBUG(dbgs() << "cloned: " << *Icl << "\n");
+	  //function->dump();
+	  Vec = Builder->CreateInsertElement(Vec, Icl, Builder->getInt32(i++));
+	  instruction_to_move_before_insertelement.push_back(Icl);
+	} else {
+	  Vec = Builder->CreateInsertElement(Vec, I, Builder->getInt32(i++));
+	  instruction_to_move_before_insertelement.push_back(I);
 	}
-	Vec = Builder->CreateInsertElement(Vec, I, Builder->getInt32(i++));
 	if (first) {
 	  first_insert=Vec;
 	  first=false;
 	}
       }
-      for( Value* V : VI ) {
+      for( Value* V : instruction_to_move_before_insertelement ) {
 	move_inst_before(cast<Instruction>(V),cast<Instruction>(first_insert));
       }
+      //DEBUG(dbgs() << "After moving:" << "\n");
+      //function->dump();
 
       Vec->mutateType( VI.at(0)->getType() );
 
@@ -344,7 +375,7 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
 
   DEBUG(dbgs() << "----------------------------------------\n");
   DEBUG(dbgs() << "After vectorize_loads\n");
-  function->dump();
+  //function->dump();
 
   return 0;
 }
@@ -494,7 +525,7 @@ bool qdp_jit_vec::runOnFunction(Function &F) {
     }
   }
 
-  function->dump();
+  //function->dump();
 
   return true;
 }
