@@ -39,7 +39,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_vec"
+#define SV_NAME "qdp_jit_vec0"
 #define DEBUG_TYPE SV_NAME
 
 
@@ -721,11 +721,10 @@ char qdp_jit_vec::ID = 0;
 static RegisterPass<qdp_jit_vec> X(SV_NAME, "QDP-JIT vectorize code");
 
 
-#if 0
 FunctionPass *llvm::create_qdp_jit_vec_pass() {
   return new qdp_jit_vec();
 }
-#endif
+
 
 
 //INITIALIZE_PASS_BEGIN(qdp_jit_vec, "qdp-jit-roll", "QDP-JIT roll code into a new loop", false, false)

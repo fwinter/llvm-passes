@@ -66,7 +66,7 @@ public:
 protected:
   struct reduction {
     SetVector<Value*> instructions;
-    std::vector<uint64_t> offsets;
+    std::vector< std::vector<uint64_t> > offsets;  // outer: iteration, inner: GEP instruction within iteration
     int id;
   };
   typedef std::vector<reduction> reductions_t;
@@ -74,7 +74,7 @@ protected:
   void add_GEPs(BasicBlock &BB);
   void collectRoots( Instruction& I, SetVector<Value*>& all_roots);
   void collectAllUses( SetVector<Value*>& to_visit, SetVector<Value*>& all_uses);
-  void collectAll( Instruction& I);
+  //  void collectAll( Instruction& I);
   void collectForStoresAllOperandsAll( SetVector<Value*>& tree );
   void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
   bool track( SetVector<Value*>& set);
@@ -87,6 +87,7 @@ protected:
 
 private:
   reductions_t reductions;
+  Function* function;
 
   Module* module;
   typedef IRBuilder<true, TargetFolder> BuilderTy;
@@ -95,51 +96,11 @@ private:
   //  AliasAnalysis *AA;
 
   BuilderTy *Builder;
-
-
-  //PointerOffsetPair getPointerOffsetPair(LoadInst &);
-  //bool combineLoads(DenseMap<const Value *, SmallVector<LoadPOPPair, 8>> &);
-  //bool aggregateLoads(SmallVectorImpl<LoadPOPPair> &);
-  //bool combineLoads(SmallVectorImpl<LoadPOPPair> &);
 };
 }
 
-// bool qdp_jit_roll::doInitialization(Function &F) {
-//   DEBUG(dbgs() << "qdp_jit_roll function: " << F.getName() << "\n");
-//   C = &F.getContext();
-//   DataLayoutPass *DLP = getAnalysisIfAvailable<DataLayoutPass>();
-//   if (!DLP) {
-//     DEBUG(dbgs() << "  Skipping qdp_jit_roll -- no target data!\n");
-//     return false;
-//   }
-//   DL = &DLP->getDataLayout();
-//   return true;
-// }
 
 
-
-
-void qdp_jit_roll::collectAll( Instruction& I) {
-  DEBUG(dbgs() << "collectAll for " << I << "\n");
-
-  std::vector<Value*> all_deps;
-  std::queue<Value*> to_visit;
-
-  to_visit.push(&I);
-
-  while (!to_visit.empty()) {
-    Value* v = to_visit.front();
-    to_visit.pop();
-    Instruction* vi;
-    if ((vi = dyn_cast<Instruction>(v))) {
-      DEBUG(dbgs() << "Found instruction " << *vi << "\n");
-      all_deps.push_back(v);
-      for (Use& U : vi->operands()) {
-	to_visit.push(U.get());
-      }
-    }
-  }
-}
 
 
 void qdp_jit_roll::collectRoots( Instruction& I, SetVector<Value*>& all_roots) {
@@ -168,12 +129,7 @@ void qdp_jit_roll::collectRoots( Instruction& I, SetVector<Value*>& all_roots) {
     }
   }
 }
-// else {
-//       if (!isa<Constant>(v)) {
-// 	DEBUG(dbgs() << "Found a non-instruction,non-constant " << *v << "\n");
-// 	all_roots.insert(v);
-//       }
-//}
+
 
 
 void qdp_jit_roll::collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands ) {
@@ -283,43 +239,46 @@ void qdp_jit_roll::add_GEPs(BasicBlock &BB) {
 
 
 bool qdp_jit_roll::track( SetVector<Value*>& set) {
-  DEBUG(dbgs() << "\n Track set with " << set.size() << " instructions.\n");
+  DEBUG(dbgs() << "Track set with " << set.size() << " instructions.\n");
 
   static int id;
 
-  if (reductions.empty()) {
-    reductions.push_back( reduction() );
-    reductions[0].instructions.insert( set.begin() , set.end() );
-    reductions[0].offsets.push_back(0);
-    reductions[0].id = id++;
-    return false;
-  }
-
+  // if (reductions.empty()) {
+  //   reductions.push_back( reduction() );
+  //   reductions[0].instructions.insert( set.begin() , set.end() );
+  //   reductions[0].offsets.push_back(0);
+  //   reductions[0].id = id++;
+  //   return false;
+  // }
 
   bool reduction_found = false;
 
-  for (reductions_t::iterator cur_reduction = reductions.begin();
-       cur_reduction != reductions.end() && !reduction_found ; 
-       ++cur_reduction ) {
+  reductions_t::iterator cur_reduction;
+
+  for ( cur_reduction = reductions.begin();
+	cur_reduction != reductions.end() && !reduction_found ; 
+	++cur_reduction ) {
 
     DEBUG(dbgs() << "Trying reduction " << cur_reduction->id << "\n");
 
-    DEBUG(dbgs() << "current reduction: " << "\n");
+
+    //DEBUG(dbgs() << "current reduction: " << "\n");
     SetVector<Value*> reduction_stores;
     for (Value *v : cur_reduction->instructions ) {
-      DEBUG(dbgs() << *v << "\n");
+      //DEBUG(dbgs() << *v << "\n");
       if (isa<StoreInst>(*v)) {
 	reduction_stores.insert(v);
       }
     }
-    DEBUG(dbgs() << "incoming set: " << "\n");
+    //DEBUG(dbgs() << "incoming set: " << "\n");
     SetVector<Value*> set_stores;
     for (Value *v : set ) {
-      DEBUG(dbgs() << *v << "\n");
+      //DEBUG(dbgs() << *v << "\n");
       if (isa<StoreInst>(*v)) {
 	set_stores.insert(v);
       }
     }
+
 
     if (cur_reduction->instructions.size() != set.size()) {
       DEBUG(dbgs() << " -> number of instructions not identical, " << cur_reduction->instructions.size() << " " << set.size() << "\n");
@@ -332,8 +291,6 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
     }
 
     bool mismatch = false;
-    bool offset_set = false;
-    int64_t offset = 0;
 
     for (uint64_t i = 0 ; i < set_stores.size() && !mismatch; ++i ) {
 
@@ -352,30 +309,6 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
 	    if ( vi0->getOpcode() == vi1->getOpcode() ) {
 	      //DEBUG(dbgs() << "found matching instructions " << *vi0 << " " << *vi1 << "\n");
 	    
-	      if (Instruction * gep0 = dyn_cast<GetElementPtrInst>(v0)) {
-		if (Instruction * gep1 = dyn_cast<GetElementPtrInst>(v1)) {
-		  //DEBUG(dbgs() << "found GEPs " << *gep0 << " " << *gep1 << "\n");
-		  //DEBUG(dbgs() << "ops " << *gep0->getOperand(1) << " " << *gep1->getOperand(1) << "\n");
-		  if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
-		    if (ConstantInt * ci1 = dyn_cast<ConstantInt>(gep1->getOperand(1))) {
-		      int64_t off0 = ci0->getZExtValue();
-		      int64_t off1 = ci1->getZExtValue();
-		      //DEBUG(dbgs() << "found Ints " << off0 << " " << off1 << "\n");
-		      if (offset_set) {
-			if ( off0-off1 != offset && off0-off1 != 0 ) {
-			  DEBUG(dbgs() << "found non-matching offsets " << off0 << " " << off1 << "\n");
-			  mismatch = true;
-			}
-		      } else {
-			offset = off0 - off1;
-			offset_set = true;
-			//DEBUG(dbgs() << "found offsets " << off0 << " " << off1 << "\n");
-		      }
-		    }
-		  }
-		}
-	      }
-
 	      for (Use& U0 : vi0->operands()) {
 		cmp0_visit.insert(U0.get());
 	      }
@@ -397,25 +330,40 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
 	}
       }
     }
+
     if (!mismatch) {
-      if (offset < 0) {
-	DEBUG(dbgs() << "found a negative offset " << offset << ". That's not supported\n");
-	exit(0);
-      }
-      DEBUG(dbgs() << " -> use_set matches, add offset " << offset << "\n");
-      cur_reduction->offsets.push_back( offset );
       reduction_found = true;
       break;
-    } 
+    }
   }
 
-  if (reduction_found)
-    return true;
+  // Scan linearily through the current set and collect GEP's offsets
 
-  DEBUG(dbgs() << "use_set doesn't match! Will add another reduction" << "\n");
+  
+  //SetVector<GetElementPtrInst*> GEPs_in_set;
+  std::vector<uint64_t> GEP_offsets;
+
+  DEBUG(dbgs() << "GEP offsets: ");
+  for (Value* I : set) {
+    if (Instruction * gep0 = dyn_cast<GetElementPtrInst>(I)) {
+      if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
+	GEP_offsets.push_back( ci0->getZExtValue() );
+	DEBUG(dbgs() << ci0->getZExtValue() << " ");
+      }
+    }
+  }
+  DEBUG(dbgs() << "\n");
+
+  if (reduction_found) {
+    DEBUG(dbgs() << "Match with reduction id = " << cur_reduction->id << "\n");
+    cur_reduction->offsets.push_back( GEP_offsets );
+    return true;
+  }
+
+  DEBUG(dbgs() << "No existing reduction matches, will add another reduction, with id = " << id << "\n");
   reductions.push_back( reduction() );
   reductions.back().instructions.insert( set.begin() , set.end() );
-  reductions.back().offsets.push_back(0);
+  reductions.back().offsets.push_back( GEP_offsets );
   reductions.back().id = id++;
   return false;
 }
@@ -423,27 +371,7 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
 
 
 
-void qdp_jit_roll::modify_loop_body( reduction& red , Value* ind_var , int64_t offset_normalize )
-{
-  for( Value* V : red.instructions ) {
-    if (GetElementPtrInst * gep0 = dyn_cast<GetElementPtrInst>(V)) {
-      if (ConstantInt * ci0 = dyn_cast<ConstantInt>(gep0->getOperand(1))) {
-	int64_t off0 = ci0->getZExtValue();
-	int64_t off_new = off0 + offset_normalize;
-	if (off_new) {
-	  //DEBUG(dbgs() << "Change offset " << off0 << " to " << off_new << "\n");
-	  Builder->SetInsertPoint(gep0);
-	  Value *new_gep_address = Builder->CreateAdd( ind_var , 
-						       ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
-									 off0 + offset_normalize ) );
-	  gep0->setOperand( 1 , new_gep_address );
-	} else {
-	  gep0->setOperand( 1 , ind_var );
-	}
-      }
-    }
-  }
-}
+
 
 
 //
@@ -451,46 +379,114 @@ void qdp_jit_roll::modify_loop_body( reduction& red , Value* ind_var , int64_t o
 //
 BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* insert_before,BasicBlock* take_instr_from)
 {
-  auto offset_max = max_element(std::begin(cur->offsets), std::end(cur->offsets));
-  auto offset_min = min_element(std::begin(cur->offsets), std::end(cur->offsets));
-  auto offset_step = 0;
+  DEBUG(dbgs() << "Insert loop called with reduction number " << cur->id << "\n");
 
-  
-  bool constant_stride=true;
-  uint64_t loop_count;
-  GlobalVariable* offset_var;
+  if (cur->offsets.size() < 2) {
+    DEBUG(dbgs() << "This reduction has only 1 iteration, we won't roll this.\n");
+    return insert_before;
+  }
 
-  if (cur->offsets.size() > 1) {
-    offset_step = cur->offsets[1] - cur->offsets[0];
-      
-    for ( uint64_t i = *offset_min ; i <= *offset_max ; i+=offset_step ) {
-      if (std::find(cur->offsets.begin(),cur->offsets.end(),i ) == cur->offsets.end()) {
-	DEBUG(dbgs() << "Checking whether loop is contiguos.\n");
-	DEBUG(dbgs() << "Iteration " << i << " not found! Must use and offset array.\n");
-	Constant* CDA = ConstantDataArray::get( llvm::getGlobalContext() , 
-						ArrayRef<uint64_t>( cur->offsets.data() , cur->offsets.size() ) );
-	ArrayType *array_type = ArrayType::get( Type::getIntNTy(getGlobalContext(),64) , cur->offsets.size() );
+  size_t gep_total_number = cur->offsets[0].size();
+  DEBUG(dbgs() << "gep_total_number = " << gep_total_number << ".\n");
 
-	offset_var = new GlobalVariable(*module, array_type , true, GlobalValue::InternalLinkage, CDA , "offset_array" );
+  std::vector<bool> gep_cont(gep_total_number);
+  std::vector<uint64_t> gep_lo(gep_total_number);
+  std::vector<uint64_t> gep_hi(gep_total_number);
+  std::vector<uint64_t> gep_step(gep_total_number);
+  std::vector<int64_t> gep_ref_delta(gep_total_number);
+  bool use_global_array=false;
+  uint64_t loop_count = cur->offsets.size();
 
-	constant_stride = false;
-	loop_count = cur->offsets.size();
+  //
+  // First we assume that all GEPs are contiguous
+  //
+  for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
+    gep_lo[ gep_num ]   = cur->offsets[0][gep_num];
+    gep_hi[ gep_num ]   = cur->offsets[1][gep_num];
+    gep_step[ gep_num ] = gep_hi[ gep_num ] - gep_lo[ gep_num ];
+    gep_cont[ gep_num ] = true;
+  }
 
-	break;
+
+  for ( size_t it_num = 2 ; it_num < cur->offsets.size() ; ++it_num ) {
+    for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
+      if ( gep_cont[ gep_num ] ) {
+	uint64_t off = cur->offsets[it_num][gep_num];
+	if ( gep_hi[gep_num] + gep_step[gep_num] == off ) {
+	  gep_hi[gep_num] = off;
+	} else {
+	  gep_cont[gep_num] = false;
+	  use_global_array = true;
+	}
       }
     }
   }
 
 
-  if (constant_stride) {
-  DEBUG(dbgs() 
-	<< "Loop rolling is possible with: min = " << *offset_min 
-	<< "   max = " << *offset_max 
-	<< "  step = " << offset_step << "\n");  
-  } else {
-    DEBUG(dbgs() << "Loop rolling is possible offset array and loop count = " << loop_count << "\n");
+  for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
+    if ( !gep_cont[ gep_num ] ) {
+      gep_ref_delta[ gep_num ] = cur->offsets[0][gep_num];
+    }
   }
+
+  std::vector< uint64_t > deltas;
+  deltas.push_back(0); // The first iteration has always a delta equal to zero
+  bool loop_roll_not_possible = false;
+
+  for ( size_t it_num = 1 ; it_num < cur->offsets.size() ; ++it_num ) {
+    bool delta_set = false;
+    int64_t delta;
+    for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
+      if ( !gep_cont[ gep_num ] ) {
+	if (!delta_set) {
+	  delta_set = true;
+	  delta = cur->offsets[it_num][gep_num] - gep_ref_delta[gep_num];
+	  if (delta < 0) {
+	    DEBUG(dbgs() << "WARNING: negative delta, " << delta << " !\n");
+	  }
+	  deltas.push_back( (uint64_t)delta );
+	} else {
+	  if (delta != (int64_t)(cur->offsets[it_num][gep_num]) - gep_ref_delta[gep_num]) {
+	    // This GEP deviates
+	    DEBUG(dbgs() << "GEP number " << gep_num << " cannot be rolled into a loop!\n");
+	    loop_roll_not_possible = true;
+	  }
+	}
+      }
+    }
+  }
+
+
+  if (!loop_roll_not_possible) {
+    for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
+      DEBUG(dbgs() << "gep " << gep_num << " : ");
+      if (gep_cont[gep_num]) {
+	DEBUG(dbgs() << "lo = " << gep_lo[gep_num] << "  ");
+	DEBUG(dbgs() << "hi = " << gep_hi[gep_num] << "  ");
+	DEBUG(dbgs() << "step = " << gep_step[gep_num] << "\n");
+      } else {
+	DEBUG(dbgs() << "not contiguous, use delta ref " << gep_ref_delta[gep_num] << "\n");
+      }
+    }
+    for (int64_t delta: deltas) {
+      DEBUG(dbgs() << delta << " ");
+    }
+    DEBUG(dbgs() << "\n");
+  } else {
+    DEBUG(dbgs() << "Loop roll not possible\n");
+  }
+
+
+  GlobalVariable* offset_var;
+  if (use_global_array) {
+    Constant* CDA = ConstantDataArray::get( llvm::getGlobalContext() , 
+					    ArrayRef<uint64_t>( deltas.data() , deltas.size() ) );
+    ArrayType *array_type = ArrayType::get( Type::getIntNTy(getGlobalContext(),64) , deltas.size() );
     
+    offset_var = new GlobalVariable(*module, array_type , true, GlobalValue::InternalLinkage, CDA , "offset_array" );
+  }
+
+
   llvm::BasicBlock *BBe = llvm::BasicBlock::Create(llvm::getGlobalContext(), "exit_loop" );
   F->getBasicBlockList().push_front(BBe);
 
@@ -509,66 +505,17 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   //Builder->SetInsertPoint(&BB,BB.begin());
   Builder->SetInsertPoint(BBl);
   PHINode * PN = Builder->CreatePHI( Type::getIntNTy(getGlobalContext(),64) , 2 );
-
   
-  // DEBUG( dbgs() << "Current instructions:\n" );
-  // for ( Value* v : cur->instructions ) {
-  //   DEBUG( dbgs() << *v << "\n" );
-  // }
-  // DEBUG( dbgs() << "--------------------\n" );
-
-  // take_instr_from->dump();
-  // DEBUG( dbgs() << "--------------------\n" );
-
-
-
   Value *cond;
   Value *PNp1;
-  Value * offset_read;
-  if (constant_stride) {
-    PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , offset_step ) );
-    cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_max ) );
-    PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , *offset_min ) , BB0 );
-    PN->addIncoming( PNp1 , BBl );
-  } else {
-    std::vector<Value*> tmp;
-    tmp.push_back( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) );
-    tmp.push_back( PN );
-    Value* offset_GEP = Builder->CreateGEP( offset_var , ArrayRef<Value*>(tmp) );
-    offset_read = Builder->CreateLoad( offset_GEP );
 
-    PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 1 ) );
-    cond = Builder->CreateICmpUGE( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , loop_count ) );
-    PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) , BB0 );
-    PN->addIncoming( PNp1 , BBl );
-  }
+  PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 1 ) );
+  cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , loop_count ) );
+  PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) , BB0 );
+  PN->addIncoming( PNp1 , BBl );
 
   Builder->CreateCondBr( cond , BBe, BBl);
 
-#if 0
-    BasicBlock::iterator inst_set_begin;
-    bool notfound = true;
-    for (inst_set_begin = take_instr_from->begin() ; inst_set_begin != take_instr_from->end() ; ++inst_set_begin ) {
-      if (cur->instructions.count(inst_set_begin)) {
-	notfound = false;
-	break;
-      }
-    }
-    if (notfound) {
-      DEBUG(dbgs() << "Could not find any instruction in the basic block that is also in the current set.\n" );    
-      return NULL;
-    }
-    BasicBlock::iterator inst_set_end;
-    for (inst_set_end = inst_set_begin ; inst_set_end != take_instr_from->end() ; ++inst_set_end ) {
-      if (!cur->instructions.count(inst_set_end)) {
-	break;
-      }
-    }
-    //successor->dump();
-    DEBUG(dbgs() << "Using the following enclosing instructions\n" );    
-    DEBUG(dbgs() << *inst_set_begin << "\n" );
-    DEBUG(dbgs() << *inst_set_end << "\n" );
-#endif
 
   BasicBlock::iterator inst_search_start = take_instr_from->begin();
   while(1) {
@@ -599,16 +546,46 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
     inst_search_start = inst_set_end;
   }
 
-  if (constant_stride) {
-    modify_loop_body( *cur , PN , 0 );
-  } else {
-    modify_loop_body( *cur , offset_read , 0 );
+
+  int gep_num = 0;
+  bool offset_loaded = false;
+  Value* offset_read;
+
+  for( Value* V : cur->instructions ) {
+    if (GetElementPtrInst * gep0 = dyn_cast<GetElementPtrInst>(V)) {
+      Builder->SetInsertPoint(gep0);
+      if (gep_cont[gep_num]) {
+	Value *new_gep_address = Builder->CreateMul( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
+									    gep_step[gep_num] ) );
+	if (gep_lo[gep_num]) {
+	  new_gep_address = Builder->CreateAdd( new_gep_address, ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
+										   gep_lo[gep_num] ) );
+	}
+
+	gep0->setOperand( 1 , new_gep_address );
+      } else {
+	if (!offset_loaded) {
+	  std::vector<Value*> tmp;
+	  tmp.push_back( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) );
+	  tmp.push_back( PN );
+	  Value* offset_GEP = Builder->CreateGEP( offset_var , ArrayRef<Value*>(tmp) );
+	  offset_read = Builder->CreateLoad( offset_GEP );
+	  offset_loaded = true;
+	}
+	Value *new_gep_address = offset_read;
+	if (gep_ref_delta[gep_num]) {
+	  new_gep_address = Builder->CreateAdd( new_gep_address, ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
+										   gep_ref_delta[gep_num] ) );
+	}
+	gep0->setOperand( 1 , new_gep_address );
+      }
+      gep_num++;
+    }
   }
 
-  DEBUG(dbgs() << "Latch after splice & modify:\n" );    
-  BBl->dump();
+  function->dump();
 
-  return BB0;
+  return insert_before;
 }
 
 
@@ -634,7 +611,7 @@ bool qdp_jit_roll::runOnModule(Module &M) {
   }
 
   Function& F = *F_ptr;
-
+  function=&F;
   
 #if 1
   DEBUG(dbgs() << "Running on F"  << "\n");
@@ -715,25 +692,7 @@ bool qdp_jit_roll::runOnModule(Module &M) {
   }
 
 
-  int i=0;
   DEBUG(dbgs() << "Number of reductions = " << reductions.size() << "\n");
-  for (reductions_t::iterator cur_reduction = reductions.begin();
-       cur_reduction != reductions.end(); 
-       ++cur_reduction,++i ) {
-    DEBUG(dbgs() << "All offsets for reduction " << i << ": ");
-    if (cur_reduction->offsets.size() > 24) {
-      DEBUG(dbgs() << cur_reduction->offsets[0] << " ");
-      DEBUG(dbgs() << cur_reduction->offsets[1] << " ");
-      DEBUG(dbgs() << " ... ");
-      DEBUG(dbgs() << cur_reduction->offsets[cur_reduction->offsets.size()-2] << " ");
-      DEBUG(dbgs() << cur_reduction->offsets[cur_reduction->offsets.size()-1] << " ");
-    } else {
-      for ( auto offset : cur_reduction->offsets ) {
-	DEBUG(dbgs() << offset << " ");
-      }
-    }
-    DEBUG(dbgs() << "\n");
-  }
 
   BasicBlock* insert_before = &BB;
   for (reductions_t::iterator cur_reduction = reductions.begin();
@@ -749,13 +708,6 @@ bool qdp_jit_roll::runOnModule(Module &M) {
 }
 
 
-
-// void qdp_jit_roll::getAnalysisUsage(AnalysisUsage &AU) const {
-//   AU.setPreservesCFG();
-
-//   AU.addRequired<AliasAnalysis>();
-//   AU.addPreserved<AliasAnalysis>();
-// }
 
 
 char qdp_jit_roll::ID = 0;
