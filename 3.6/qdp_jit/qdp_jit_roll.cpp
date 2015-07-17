@@ -568,9 +568,11 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
 	  std::vector<Value*> tmp;
 	  tmp.push_back( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) );
 	  tmp.push_back( PN );
+	  Builder->SetInsertPoint( PN->getNextNode() );
 	  Value* offset_GEP = Builder->CreateGEP( offset_var , ArrayRef<Value*>(tmp) );
 	  offset_read = Builder->CreateLoad( offset_GEP );
 	  offset_loaded = true;
+	  Builder->SetInsertPoint(gep0);
 	}
 	Value *new_gep_address = offset_read;
 	if (gep_ref_delta[gep_num]) {
@@ -583,7 +585,7 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
     }
   }
 
-  function->dump();
+  //function->dump();
 
   return insert_before;
 }
@@ -652,11 +654,6 @@ bool qdp_jit_roll::runOnModule(Module &M) {
 	DEBUG(rso << "Uses (incl. from other reachable stores) = " << all_uses.size() << "\n");
 
 
-#if 0
-	for (Value *v : all_uses)
-	  DEBUG(dbgs() << *v << "\n");
-#endif
-
 	if (track(all_uses)) {
 	  for_erasure.insert( all_uses.begin(), all_uses.end() );
 	  marked_erasure++;
@@ -702,7 +699,7 @@ bool qdp_jit_roll::runOnModule(Module &M) {
     insert_before = insert_loop( cur_reduction , &F , insert_before , &BB );
   }
 
-  //  F.dump();
+  //F.dump();
 #endif
   return true;
 }

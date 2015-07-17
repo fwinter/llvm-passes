@@ -77,6 +77,7 @@ protected:
   void move_inst_before(Instruction* to_move,Instruction* before);
   Instruction* clone_with_operands(Instruction* to_clone,Instruction* insert_point);
   Instruction* clone_with_operands(Instruction* to_clone); // uses Builder
+  Value* get_vector_version( Value* scalar_version );
 
 private:
   reductions_t reductions;
@@ -85,6 +86,8 @@ private:
   Function* function;
   BasicBlock* orig_BB;
   BasicBlock* vec_BB;
+
+  std::vector<std::pair<Value*,Value*> > scalar_vector_pairs;
 
   Module* module;
   typedef IRBuilder<true, TargetFolder> BuilderTy;
@@ -151,139 +154,92 @@ bool get_last_elements_as_instructions(std::vector<SetVector<Value*> >& visit , 
 }
 
 
-Value* get_vector_version( std::vector<std::pair<Value*,Value*> > scalar_vector_loads , Value* scalar_version )
+
+Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
 {
-  Value* ret;
-  bool found=false;
-  for ( std::vector<std::pair<Value*,Value*> >::iterator it = scalar_vector_loads.begin();
-	it != scalar_vector_loads.end();
+  DEBUG(dbgs() << "get_vector_version: scalar version: " << *scalar_version << "\n");
+
+  if (StoreInst* SI = dyn_cast<StoreInst>(scalar_version)) {
+    unsigned AS = SI->getPointerAddressSpace();
+
+    SequentialType* ST = cast<SequentialType>(SI->getPointerOperand()->getType());
+    //DEBUG(dbgs() << "store pointer operand type: " << *ST->getElementType() << "\n");
+    if (isa<VectorType>(ST->getElementType())) {
+      assert( 0 && "did not expect a vector type store instruction" );
+    }
+
+    //DEBUG(dbgs() << "store:        " << *SI << "\n");
+
+    // DEBUG(dbgs() << "store value:   " << *SI->getValueOperand() << "\n");
+    // DEBUG(dbgs() << "store pointer: " << *SI->getPointerOperand() << "\n");
+
+    Instruction* GEP = cast<Instruction>(SI->getPointerOperand());
+
+    Instruction* GEPcl = clone_with_operands( GEP );
+
+    Value* vec_value  = get_vector_version( SI->getValueOperand() );
+    Value *VecPtr     = Builder->CreateBitCast( GEPcl , vec_value->getType()->getPointerTo(AS) );
+    Value* vecstore = Builder->CreateStore( vec_value , VecPtr );
+    DEBUG(dbgs() << "vec store created " << *vecstore << "\n");
+    return vecstore;
+  }
+
+  for ( std::vector<std::pair<Value*,Value*> >::iterator it = scalar_vector_pairs.begin();
+	it != scalar_vector_pairs.end();
 	++it ) {
+    DEBUG(dbgs() << "search: " << *it->first << "\n");
     if ( it->first == scalar_version ) {
-      ret = it->second;
-      found=true;
-      break;
+      DEBUG(dbgs() << "found it, it was already there!\n");
+      return it->second;
     }
   }
-  assert( found && "scalar version not found!" );
-  return ret;
+
+
+  Instruction* I = cast<Instruction>(scalar_version);
+
+  std::vector<Value*> operands;
+  for (Use& U : I->operands()) 
+    operands.push_back(U.get());
+
+  //I->getOperand(0);
+
+  unsigned Opcode = I->getOpcode();
+  switch (Opcode) {
+  case Instruction::FMul: {
+    Value* V = Builder->CreateFMul( get_vector_version( operands.at(0) ) ,
+				    get_vector_version( operands.at(1) ) );
+    scalar_vector_pairs.push_back( std::make_pair( I , V ) );
+    DEBUG(dbgs() << "vec mul created " << *V << "\n");
+    return V;
+  }
+    break;
+  case Instruction::FAdd: {
+    Value* V = Builder->CreateFAdd( get_vector_version( operands.at(0) ) ,
+				    get_vector_version( operands.at(1) ) );
+    scalar_vector_pairs.push_back( std::make_pair( I , V ) );
+    DEBUG(dbgs() << "vec add created " << *V << "\n");
+    return V;
+  }
+    break;
+  case Instruction::FSub: {
+    Value* V = Builder->CreateFSub( get_vector_version( operands.at(0) ) ,
+				    get_vector_version( operands.at(1) ) );
+    scalar_vector_pairs.push_back( std::make_pair( I , V ) );
+    DEBUG(dbgs() << "vec sub created " << *V << "\n");
+    return V;
+  }
+    break;
+  default:
+    assert( 0 && "opcode not found!" );
+    return NULL;
+  }
+
+  assert( 0 && "strange!" );
+  return NULL;
 }
 
 
-void push_back_if_not_already_in( std::deque<Instruction*>& de , Instruction* I )
-{
-  bool found=false;
-  for ( std::deque<Instruction*>::iterator it = de.begin();
-	it != de.end();
-	++it ) {
-    if ( *it == I ) {
-      found=true;
-      break;
-    }
-  }
-  if (!found) {
-    DEBUG(dbgs() << "inserting " << *I << "\n");
-    de.push_back(I);
-  }
-}
 
-
-void qdp_jit_vec::vectorize_all_uses( std::vector<std::pair<Value*,Value*> > scalar_vector_loads )
-{
-  //Value* VLI = vector_loads.at(0);
-  //DEBUG(dbgs() << "VLI type " << *VLI->getType() << "\n");
-
-  std::deque<Instruction*> to_visit;
-  for( std::pair<Value*,Value*> V: scalar_vector_loads ) {
-    for (Use &U : V.first->uses()) {
-      Value* VU = U.getUser();
-      if (Instruction* I = dyn_cast<Instruction>(VU)) {
-	push_back_if_not_already_in( to_visit , I );
-      }
-    }
-  }
-
-  //Builder->SetInsertPoint( insert_point );
- 
-  while (!to_visit.empty()) {
-    Instruction* I = to_visit.front();
-    DEBUG(dbgs() << "to_visit size " << to_visit.size() << " visiting " << *I << "\n");
-    //all_uses.insert(v);
-    to_visit.pop_front();
-
-    if (StoreInst* SI = dyn_cast<StoreInst>(I)) {
-
-      unsigned AS = SI->getPointerAddressSpace();
-
-      SequentialType* ST = cast<SequentialType>(SI->getPointerOperand()->getType());
-      //DEBUG(dbgs() << "store pointer operand type: " << *ST->getElementType() << "\n");
-      if (isa<VectorType>(ST->getElementType())) {
-	assert( 0 && "did not expect a vector type store instruction" );
-      }
-
-      DEBUG(dbgs() << "store:        " << *SI << "\n");
-
-      // DEBUG(dbgs() << "store value:   " << *SI->getValueOperand() << "\n");
-      // DEBUG(dbgs() << "store pointer: " << *SI->getPointerOperand() << "\n");
-
-      Instruction* GEP = cast<Instruction>(SI->getPointerOperand());
-
-      Instruction* GEPcl = clone_with_operands( GEP );
-
-      Value* vec_value  = get_vector_version( scalar_vector_loads , SI->getValueOperand() );
-      Value *VecPtr     = Builder->CreateBitCast( GEPcl , vec_value->getType()->getPointerTo(AS) );
-      Builder->CreateStore( get_vector_version( scalar_vector_loads , SI->getValueOperand() ), VecPtr );
-
-      // Value* vec_value  = get_vector_version( scalar_vector_loads , SI->getValueOperand() );
-      // Value *VecPtr     = Builder->CreateBitCast(SI->getPointerOperand(),vec_value->getType()->getPointerTo(AS) );
-      // Value *VecStore   = Builder->CreateStore( get_vector_version( scalar_vector_loads , SI->getValueOperand() ), 
-      // 						VecPtr );
-
-      // DEBUG(dbgs() << "vec_all_uses: created vector store: " << *VecStore << "\n");
-      // function->dump();
-
-      //SI->setOperand(1,VecPtr);
-
-    } else {
-
-      std::vector<Value*> operands;
-      for (Use& U : I->operands()) 
-	operands.push_back(U.get());
-
-      //I->getOperand(0);
-
-      unsigned Opcode = I->getOpcode();
-      switch (Opcode) {
-      case Instruction::FMul: {
-	Value* V = Builder->CreateFMul( get_vector_version( scalar_vector_loads , operands.at(0) ) ,
-					get_vector_version( scalar_vector_loads , operands.at(1) ) );
-	scalar_vector_loads.push_back( std::make_pair( I , V ) );
-      }
-	break;
-      case Instruction::FAdd: {
-	Value* V = Builder->CreateFAdd( get_vector_version( scalar_vector_loads , operands.at(0) ) ,
-					get_vector_version( scalar_vector_loads , operands.at(1) ) );
-	scalar_vector_loads.push_back( std::make_pair( I , V ) );
-      }
-	break;
-      case Instruction::FSub: {
-	Value* V = Builder->CreateFSub( get_vector_version( scalar_vector_loads , operands.at(0) ) ,
-					get_vector_version( scalar_vector_loads , operands.at(1) ) );
-	scalar_vector_loads.push_back( std::make_pair( I , V ) );
-      }
-	break;
-      default:
-	assert( 0 && "opcode not found!" );
-      }
-
-      for (Use &U : I->uses()) {
-	Value* VU = U.getUser();
-	if (Instruction* I = dyn_cast<Instruction>(VU)) {
-	  push_back_if_not_already_in(to_visit,I);
-	}
-      }
-    }
-  }
-}
 
 
 
@@ -341,7 +297,8 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
 {
   DEBUG(dbgs() << "Vectorize loads, total of " << load_instructions.size() << "\n");
 
-  std::vector<std::pair<Value*,Value*> > scalar_vector_loads;
+  //std::vector<std::pair<Value*,Value*> > scalar_vector_loads;
+  scalar_vector_pairs.clear();
 
   if (load_instructions.empty())
     return 0;
@@ -406,7 +363,7 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
       // Value *VecPtr = Builder->CreateBitCast(LI->getPointerOperand(),VecTy->getPointerTo(AS));
       // Value *VecLoad = Builder->CreateLoad( VecPtr );
 
-      scalar_vector_loads.push_back( std::make_pair( VI.at(0) , VecLoad ) );
+      scalar_vector_pairs.push_back( std::make_pair( VI.at(0) , VecLoad ) );
     } else {
       DEBUG(dbgs() << "Loads not consecutive:\n");
       for (Value* V: VI) {
@@ -432,11 +389,44 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
 	Vec = Builder->CreateInsertElement(Vec, I, Builder->getInt32(i++));
       }
 
-      scalar_vector_loads.push_back( std::make_pair( VI.at(0) , Vec ) );      
+      scalar_vector_pairs.push_back( std::make_pair( VI.at(0) , Vec ) );      
     }
   }
 
-  vectorize_all_uses( scalar_vector_loads );
+  //vectorize_all_uses( scalar_vector_loads );
+
+  DEBUG(dbgs() << "Searching for the stores:\n");
+  //function->dump();
+
+  //
+  // Vectorize all StoreInst reachable by the first load of each vector of loads
+  //
+  {
+    SetVector<Instruction*> to_visit;
+    SetVector<Instruction*> stores_processed;
+    for( std::vector<Instruction*>& VI : load_instructions ) {
+      to_visit.insert(VI.at(0));
+    }
+    while (!to_visit.empty()) {
+      Instruction* I = to_visit.back();
+      to_visit.pop_back();
+      DEBUG(dbgs() << "visiting " << *I << "\n");
+      if (StoreInst* SI = dyn_cast<StoreInst>(I)) {
+	if (!stores_processed.count(SI)) {
+	  get_vector_version( SI );
+	  stores_processed.insert( SI );
+	}
+      } else {
+	for (Use &U : I->uses()) {
+	  Value* V = U.getUser();
+	  to_visit.insert(cast<Instruction>(V));
+	}
+      }
+    }
+  }
+
+  // DEBUG(dbgs() << "After vectorizing the stores\n");
+  // function->dump();
 
   //
   // Mark all stores as being processed
@@ -475,60 +465,8 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
 }
 
 
-#if 0
-void qdp_jit_vec::mark_for_erasure_all_operands(Value* V)
-{
-  std::queue<Value*> to_visit;
-
-  to_visit.push(V);
-
-  while (!to_visit.empty()) {
-    Value* v = to_visit.front();
-    to_visit.pop();
-    Instruction* vi;
-    if ((vi = dyn_cast<Instruction>(v))) {
-      DEBUG(dbgs() << "Found instruction " << *vi << "\n");
-      for_erasure.insert(v);
-      for (Use& U : vi->operands()) {
-	to_visit.push(U.get());
-      }
-    }
-  }
-}
-#endif
 
 
-
-
-// void qdp_jit_vec::mark_for_erasure_all_operands(Value* V)
-// {
-//   if (!isa<Instruction>(V)) {
-//     assert( 0 && "mark_for_erasure not an instruction!" );
-//     exit(0);
-//   }
-//   SetVector<Instruction*> to_visit;
-
-//   to_visit.insert(cast<Instruction>(V));
-
-//   while (!to_visit.empty()) {
-//     Instruction* I = to_visit.back();
-//     to_visit.pop_back();
-
-//     for (Use& U : I->operands()) {
-//       if (Instruction* OPI = dyn_cast<Instruction>(U.get())) {
-// 	to_visit.insert(OPI);
-//       }
-//     }
-//     DEBUG(dbgs() << "erasing instruction " << *I << "\n");
-    
-//     if (!I->use_empty())
-//       I->replaceAllUsesWith(UndefValue::get(I->getType()));
-//     I->eraseFromParent();
-//   }
-// }
-
-
-#if 1
 void qdp_jit_vec::mark_for_erasure_all_operands(Value* V)
 {
   SetVector<Value*> to_visit;
@@ -548,7 +486,7 @@ void qdp_jit_vec::mark_for_erasure_all_operands(Value* V)
     }
   }
 }
-#endif
+
 
 
 void qdp_jit_vec::vectorize( reductions_iterator red )
@@ -595,16 +533,6 @@ void qdp_jit_vec::vectorize( reductions_iterator red )
      DEBUG(dbgs() << "match!\n");
      vectorize_loads( load_instructions );
      DEBUG(dbgs() << "vectorization successful on set of " << load_instructions.size() << " load sets\n");
-#if 0
-     for ( StoreInst* SI : red->instructions ) {
-       to_erase.insert(SI);
-     }
-     DEBUG(dbgs() << "to_erase:\n");
-     for ( Value* V : to_erase ) {
-       DEBUG(dbgs() << *V << "\n");
-       mark_for_erasure_all_operands(V);
-     }
-#endif
   }
 }
 
@@ -623,29 +551,39 @@ void qdp_jit_vec::track( StoreInst* SI , int64_t offset )
 
 
   if (reductions.empty()) {
+    DEBUG(dbgs() << "set of reductions empty, will create a new one.\n");
     reduction r(SI,offset);
     reductions.push_back(r);
     return;
   }
+
   reductions_iterator red_match;
-  bool found=false;
+  bool found_vectorization = false;
+  bool found_reduction = false;
   for (reductions_iterator r = reductions.begin() ; r != reductions.end() ; ++r ) {
     if ( r->hi == offset ) {
+      found_reduction = true;
       r->instructions.push_back( SI );
       r->hi++;
       if (r->hi - r->lo == vector_length) {
 	DEBUG(dbgs() << "Found vectorization! lo=" << r->lo << " hi=" << r->hi << "\n");
 	red_match = r;
-	found=true;
+	found_vectorization = true;
+	break;
       }
     }
   }
-  if (found) {
+
+  if (found_vectorization) {
     DEBUG(dbgs() << "Do vectorization..." << "\n");
     vectorize( red_match );
 
     DEBUG(dbgs() << "Remove reduction..." << "\n");
     reductions.erase( red_match );
+  } else if (!found_reduction) {
+    DEBUG(dbgs() << "none of the reductions matches, will create a new one.\n");
+    reduction r(SI,offset);
+    reductions.push_back(r);
   }
 }
 
@@ -653,6 +591,7 @@ void qdp_jit_vec::track( StoreInst* SI , int64_t offset )
 
 bool qdp_jit_vec::runOnFunction(Function &F) {
   //DEBUG(dbgs() << "qdp_jit_vec running on Function " << F << "\n");
+  //dbgs() << "qdp_jit_vec running on Function " << F << "\n";
   //module = &M;
   IRBuilder<true, TargetFolder> TheBuilder(F.getContext(), TargetFolder(DL));
   Builder = &TheBuilder;
