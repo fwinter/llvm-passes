@@ -393,7 +393,8 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   std::vector<uint64_t> gep_lo(gep_total_number);
   std::vector<uint64_t> gep_hi(gep_total_number);
   std::vector<uint64_t> gep_step(gep_total_number);
-  std::vector<int64_t> gep_ref_delta(gep_total_number);
+  std::vector<int64_t>  gep_GA_delta(gep_total_number);
+  std::vector<size_t>   gep_GA_num(gep_total_number);    // match number within the match vector
   bool use_global_array=false;
   uint64_t loop_count = cur->offsets.size();
 
@@ -422,68 +423,85 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
     }
   }
 
+  typedef std::pair< int64_t , size_t > PairDeltaGEPnum_t;  // delta, GEP num
+  typedef std::pair< std::vector<int64_t> , std::vector< PairDeltaGEPnum_t > > Match_t; // offsets, GEP deltas
 
-  for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
-    if ( !gep_cont[ gep_num ] ) {
-      gep_ref_delta[ gep_num ] = cur->offsets[0][gep_num];
-    }
-  }
+  std::vector< Match_t > matches;
 
-  std::vector< uint64_t > deltas;
-  deltas.push_back(0); // The first iteration has always a delta equal to zero
-  bool loop_roll_not_possible = false;
+  if (use_global_array) {
 
-  for ( size_t it_num = 1 ; it_num < cur->offsets.size() ; ++it_num ) {
-    bool delta_set = false;
-    int64_t delta;
+    SetVector<size_t> unmatched_gep;
     for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
       if ( !gep_cont[ gep_num ] ) {
-	if (!delta_set) {
-	  delta_set = true;
-	  delta = cur->offsets[it_num][gep_num] - gep_ref_delta[gep_num];
-	  if (delta < 0) {
-	    DEBUG(dbgs() << "WARNING: negative delta, " << delta << " !\n");
-	  }
-	  deltas.push_back( (uint64_t)delta );
-	} else {
-	  if (delta != (int64_t)(cur->offsets[it_num][gep_num]) - gep_ref_delta[gep_num]) {
-	    // This GEP deviates
-	    DEBUG(dbgs() << "GEP number " << gep_num << " cannot be rolled into a loop!\n");
-	    loop_roll_not_possible = true;
+	unmatched_gep.insert(gep_num);
+      }
+    }
+
+    while (!unmatched_gep.empty()) {
+      size_t gep_num0 = *unmatched_gep.begin();
+      DEBUG(dbgs() << "Processing GEP_num=" << gep_num0 << "\n");
+	  
+      {
+	std::vector<int64_t> offsets_gep0;
+	for ( size_t it_num = 0 ; it_num < cur->offsets.size() ; ++it_num ) {
+	  offsets_gep0.push_back( cur->offsets[it_num][gep_num0] );
+	}
+	matches.push_back( Match_t() );
+	matches.back().first = std::move( offsets_gep0 );
+	matches.back().second.push_back( std::make_pair( 0 , gep_num0 ) );
+      }
+
+      size_t gep1_start = *(unmatched_gep.begin()+1);
+      DEBUG(dbgs() << "lo=" << gep1_start << " hi=" << gep1_start+unmatched_gep.size()-1 << "\n");
+
+      for (size_t gep_num1 = gep1_start; gep_num1 < gep1_start+unmatched_gep.size()-1 ; ++gep_num1 ) {
+	DEBUG(dbgs() << "Trying GEP " << gep_num0 << " and " << gep_num1 << "\n");
+	
+	bool match=true;
+	int64_t diff = cur->offsets[0][gep_num1] - cur->offsets[0][gep_num0];
+	for ( size_t it_num = 1 ; it_num < cur->offsets.size() && match ; ++it_num ) {
+	  match = (diff == (int64_t)cur->offsets[it_num][gep_num1] - (int64_t)cur->offsets[it_num][gep_num0]);
+	  if (!match) {
+	    DEBUG(dbgs() << "no match on iteration " << it_num << "\n");
 	  }
 	}
+      
+	if (match) {
+	  DEBUG(dbgs() << "new match: diff=" << diff << " GEP_num=" << gep_num1 << "\n");
+	  matches.back().second.push_back( std::make_pair( diff , gep_num1 ) );
+	  unmatched_gep.remove( gep_num1 );
+	}
       }
+
+      unmatched_gep.remove( gep_num0 );
+      DEBUG(dbgs() << "unmatched_gep: ");
+      for (size_t i : unmatched_gep) {
+	DEBUG(dbgs() << i << " ");
+      }
+      DEBUG(dbgs() << "\n");
     }
   }
 
-
-  if (!loop_roll_not_possible) {
-    for ( size_t gep_num = 0 ; gep_num < gep_total_number ; ++gep_num ) {
-      DEBUG(dbgs() << "gep " << gep_num << " : ");
-      if (gep_cont[gep_num]) {
-	DEBUG(dbgs() << "lo = " << gep_lo[gep_num] << "  ");
-	DEBUG(dbgs() << "hi = " << gep_hi[gep_num] << "  ");
-	DEBUG(dbgs() << "step = " << gep_step[gep_num] << "\n");
-      } else {
-	DEBUG(dbgs() << "not contiguous, use delta ref " << gep_ref_delta[gep_num] << "\n");
-      }
-    }
-    for (int64_t delta: deltas) {
-      DEBUG(dbgs() << delta << " ");
+  DEBUG(dbgs() << "matches (GEP num,delta) :\n");
+  for (size_t i = 0 ; i < matches.size() ; ++i ) {
+    DEBUG(dbgs() << i << ": ");
+    for (PairDeltaGEPnum_t p : matches[i].second) {
+      DEBUG(dbgs() << p.second << "," << p.first << "  ");
+      gep_GA_delta[p.second] = p.first;
+      gep_GA_num[p.second] = i;
     }
     DEBUG(dbgs() << "\n");
-  } else {
-    DEBUG(dbgs() << "Loop roll not possible\n");
   }
-
-
-  GlobalVariable* offset_var;
-  if (use_global_array) {
-    Constant* CDA = ConstantDataArray::get( llvm::getGlobalContext() , 
-					    ArrayRef<uint64_t>( deltas.data() , deltas.size() ) );
-    ArrayType *array_type = ArrayType::get( Type::getIntNTy(getGlobalContext(),64) , deltas.size() );
     
-    offset_var = new GlobalVariable(*module, array_type , true, GlobalValue::InternalLinkage, CDA , "offset_array" );
+  std::vector<GlobalVariable*> offset_var( matches.size() );
+  for (size_t match_it = 0 ; match_it < matches.size() ; ++match_it ) {
+    Constant* CDA = ConstantDataArray::get( llvm::getGlobalContext() , 
+					    ArrayRef<uint64_t>( (uint64_t*)matches[match_it].first.data() , 
+								matches[match_it].first.size() ) );
+    ArrayType *array_type = ArrayType::get( Type::getIntNTy(getGlobalContext(),64) , matches[match_it].first.size() );
+    
+    offset_var[match_it] = new GlobalVariable( *module, array_type , true, 
+					       GlobalValue::InternalLinkage, CDA , "offset_array" );
   }
 
 
@@ -548,8 +566,8 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
 
 
   int gep_num = 0;
-  bool offset_loaded = false;
-  Value* offset_read;
+  std::vector<bool>   match_idx_loaded(matches.size());    // 
+  std::vector<Value*> match_idx(matches.size());    // 
 
   for( Value* V : cur->instructions ) {
     if (GetElementPtrInst * gep0 = dyn_cast<GetElementPtrInst>(V)) {
@@ -564,21 +582,25 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
 
 	gep0->setOperand( 1 , new_gep_address );
       } else {
-	if (!offset_loaded) {
+
+	if (!match_idx_loaded[ gep_GA_num[ gep_num ] ]) {
 	  std::vector<Value*> tmp;
 	  tmp.push_back( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) );
 	  tmp.push_back( PN );
 	  Builder->SetInsertPoint( PN->getNextNode() );
-	  Value* offset_GEP = Builder->CreateGEP( offset_var , ArrayRef<Value*>(tmp) );
-	  offset_read = Builder->CreateLoad( offset_GEP );
-	  offset_loaded = true;
+	  Value* offset_GEP = Builder->CreateGEP( offset_var.at( gep_GA_num[ gep_num ] ) , ArrayRef<Value*>(tmp) );
+	  match_idx[ gep_GA_num[ gep_num ] ]   = Builder->CreateLoad( offset_GEP );
+	  match_idx_loaded[ gep_GA_num[ gep_num ] ] = true;
 	  Builder->SetInsertPoint(gep0);
+	  DEBUG(dbgs() << "GEP num " << gep_num << " uses match num " << gep_GA_num[ gep_num ] << "\n" );
 	}
-	Value *new_gep_address = offset_read;
-	if (gep_ref_delta[gep_num]) {
+
+	Value *new_gep_address = match_idx[ gep_GA_num[ gep_num ] ];
+	if (gep_GA_delta[gep_num]) {
 	  new_gep_address = Builder->CreateAdd( new_gep_address, ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 
-										   gep_ref_delta[gep_num] ) );
+										   gep_GA_delta[gep_num] ) );
 	}
+
 	gep0->setOperand( 1 , new_gep_address );
       }
       gep_num++;
@@ -586,6 +608,7 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   }
 
   //function->dump();
+
 
   return insert_before;
 }
