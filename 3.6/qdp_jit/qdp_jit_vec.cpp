@@ -39,7 +39,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_vec0"
+#define SV_NAME "qdp_jit_vec"
 #define DEBUG_TYPE SV_NAME
 
 
@@ -588,6 +588,44 @@ void qdp_jit_vec::track( StoreInst* SI , int64_t offset )
 }
 
 
+void sort_stores(BasicBlock* BB)
+{
+  std::vector< std::pair< uint64_t , StoreInst* > > stores;
+  Instruction* Ret;
+
+  for (Instruction& I : *BB) {
+    if (StoreInst* SI = dyn_cast<StoreInst>(&I)) {
+      Value* V = SI->getOperand(1);
+      if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(V)) {
+	//DEBUG(dbgs() << "Found GEP " << *GEP << "\n");
+	if (ConstantInt * CI = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
+	  uint64_t off = CI->getZExtValue();
+	  stores.push_back( std::make_pair(off,SI) );
+	}
+      }
+    }
+    if (ReturnInst* RI = dyn_cast<ReturnInst>(&I)) {
+      Ret = RI;
+    }
+  }
+
+  DEBUG(dbgs() << "Sorting " << stores.size() << " stores according to their offset\n");
+  std::sort(stores.begin(), stores.end(), 
+	    [](const std::pair<uint64_t , StoreInst*> &left, 
+	       const std::pair<uint64_t , StoreInst*> &right) {
+    return left.first < right.first;
+	    });
+  DEBUG(dbgs() << "done sorting!\n");
+
+  for ( std::pair<uint64_t , StoreInst*>& p : stores ) {
+    p.second->removeFromParent();
+    p.second->insertBefore(Ret);
+  }
+
+  //BB->dump();
+}
+
+
 
 bool qdp_jit_vec::runOnFunction(Function &F) {
   //DEBUG(dbgs() << "qdp_jit_vec running on Function " << F << "\n");
@@ -599,6 +637,10 @@ bool qdp_jit_vec::runOnFunction(Function &F) {
   BasicBlock& BB = F.getEntryBlock();
   function = &F;
   orig_BB = &BB;
+
+
+  sort_stores(orig_BB);
+
 
   vec_BB = llvm::BasicBlock::Create(llvm::getGlobalContext(), "vectorized" );
   function->getBasicBlockList().push_front(vec_BB);

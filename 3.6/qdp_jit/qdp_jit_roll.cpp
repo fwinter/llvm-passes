@@ -38,7 +38,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_roll0"
+#define SV_NAME "qdp_jit_roll"
 #define DEBUG_TYPE SV_NAME
 
 //STATISTIC(NumLoadsAnalyzed, "Number of loads analyzed for combining");
@@ -528,7 +528,7 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   Value *PNp1;
 
   PNp1 = Builder->CreateNSWAdd( PN , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 1 ) );
-  cond = Builder->CreateICmpUGT( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , loop_count ) );
+  cond = Builder->CreateICmpUGE( PNp1 , ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , loop_count ) );
   PN->addIncoming( ConstantInt::get( Type::getIntNTy(getGlobalContext(),64) , 0 ) , BB0 );
   PN->addIncoming( PNp1 , BBl );
 
