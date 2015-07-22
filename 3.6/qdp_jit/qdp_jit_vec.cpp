@@ -39,7 +39,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_vec"
+#define SV_NAME "qdp_jit_vec0"
 #define DEBUG_TYPE SV_NAME
 
 
@@ -78,6 +78,13 @@ protected:
   Instruction* clone_with_operands(Instruction* to_clone,Instruction* insert_point);
   Instruction* clone_with_operands(Instruction* to_clone); // uses Builder
   Value* get_vector_version( Value* scalar_version );
+  SetVector<Value*> get_loads( Value* V );
+  SetVector<Value*> get_loads( SetVector<Value*> V );
+  SetVector<Value*> get_stores( Value* V );
+  SetVector<Value*> get_stores( SetVector<Value*> V );
+  SetVector<Value*> get_all_linked_stores_from_store( Value* V );
+  void push_back_if_not_already_in( std::vector< std::vector<Instruction*> >& loads,
+				    const std::vector<Instruction*>& n);
 
 private:
   reductions_t reductions;
@@ -230,6 +237,7 @@ Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
   }
     break;
   default:
+    dbgs() << Instruction::getOpcodeName(Opcode) << "\n";
     assert( 0 && "opcode not found!" );
     return NULL;
   }
@@ -489,38 +497,159 @@ void qdp_jit_vec::mark_for_erasure_all_operands(Value* V)
 
 
 
+SetVector<Value*> qdp_jit_vec::get_stores( Value* V )
+{
+  SetVector<Value*> stores;
+  SetVector<Value*> to_visit;
+  to_visit.insert(V);
+
+  while (!to_visit.empty()) {
+    Value* v = to_visit.back();
+    to_visit.pop_back();
+    Instruction* vi;
+    if ((vi = dyn_cast<Instruction>(v))) {
+      for (Use& U : vi->uses()) {
+	if (isa<StoreInst>(U.getUser())) {
+	  stores.insert(U.getUser());
+	} else if (isa<Instruction>(U.getUser())) {
+	  to_visit.insert(U.getUser());
+	}
+      }
+    }
+  }
+  return stores;
+}
+
+
+SetVector<Value*> qdp_jit_vec::get_loads( SetVector<Value*> Vec )
+{
+  SetVector<Value*> loads;
+  for (Value* V : Vec) {
+    SetVector<Value*> tmp = get_loads( V );
+    loads.insert( tmp.begin() , tmp.end() );
+  }
+  return loads;
+}
+
+SetVector<Value*> qdp_jit_vec::get_stores( SetVector<Value*> Vec )
+{
+  SetVector<Value*> stores;
+  for (Value* V : Vec) {
+    SetVector<Value*> tmp = get_stores( V );
+    stores.insert( tmp.begin() , tmp.end() );
+  }
+  return stores;
+}
+
+
+SetVector<Value*> qdp_jit_vec::get_all_linked_stores_from_store( Value* V )
+{
+  bool all=false;
+  SetVector<Value*> stores;
+  stores.insert(V);
+  while(!all) {
+    SetVector<Value*> new_stores;
+    new_stores = get_stores( get_loads( stores ) );
+    all = (new_stores.size() == stores.size());
+    stores = new_stores;
+  }
+  return stores;
+}
+
+
+SetVector<Value*> qdp_jit_vec::get_loads( Value* V )
+{
+  SetVector<Value*> loads;
+  SetVector<Value*> to_visit;
+  to_visit.insert(V);
+
+  while (!to_visit.empty()) {
+    Value* v = to_visit.back();
+    to_visit.pop_back();
+    Instruction* vi;
+    if ((vi = dyn_cast<Instruction>(v))) {
+      for (Use& U : vi->operands()) {
+	if (isa<LoadInst>(U.get())) {
+	  loads.insert(U.get());
+	} else if (isa<Instruction>(U.get())) {
+	  to_visit.insert(U.get());
+	}
+      }
+    }
+  }
+  return loads;
+}
+
+
+void qdp_jit_vec::push_back_if_not_already_in( std::vector< std::vector<Instruction*> >& loads,
+					       const std::vector<Instruction*>& n)
+{
+  bool found=false;
+  for (size_t i = 0 ; i < loads.size() && !found ; ++i )
+    found = loads[i] == n;
+  if (!found)
+    loads.push_back(n);
+}
+
+
+
 void qdp_jit_vec::vectorize( reductions_iterator red )
 {
   int vec_len = red->hi - red->lo;
 
   std::vector<std::vector<Instruction*> > load_instructions;
 
-  //SetVector<Value*> to_erase;
-  std::vector<SetVector<Value*> > visit(vec_len);
-  int i=0;
+  // innermost: the visit buffer
+  // next: vector within a SIMD
+  // next: vector of linked stores (reachable following the DAG from the first store) 
+  std::vector< std::vector<SetVector<Value*> > > visit;
+
+  size_t i=0;
   for ( StoreInst* SI : red->instructions ) {
-    //if (i>0)
-    //to_erase.insert(SI);
     DEBUG(dbgs() << "insert to visit " << *SI << "\n");
-    visit[i++].insert( cast<Value>(SI) );
+    //visit[i++].insert( cast<Value>(SI) );
+    SetVector<Value*> linked_stores = get_all_linked_stores_from_store( SI );
+    for (Value* V:linked_stores) {
+      DEBUG(dbgs() << "linked: " << *V << "\n");
+    }
+    size_t linked=0;
+    for (Value* V:linked_stores) {
+      if (visit.size() <= linked) {
+	DEBUG(dbgs() << "resizing visit to " << linked+1 << "\n");
+	visit.resize( linked+1 );
+      }
+      for (size_t q=0 ; q < visit.size() ; q++ )
+	if (visit[q].size() < i+1) {
+	  DEBUG(dbgs() << "resizing visit[" << q << "] to " << i+1 << "\n");
+	  visit[q].resize(i+1);
+	}
+      visit[linked][i].insert( V );
+      linked++;
+    }
+    i++;
   }
 
+
   bool mismatch=false;
-  while ( is_visit_vector_non_empty(visit) && !mismatch ) {
 
-    std::vector<Instruction*> vi;
-    if (!get_last_elements_as_instructions(visit,vi)) {
-      mismatch=true;
-      break;
-    }
+  for ( size_t q = 0 ; q < visit.size() ; ++q ) {
+    DEBUG(dbgs() << "Checking DAG for linked store number " << q << "\n");
+    while ( is_visit_vector_non_empty(visit[q]) && !mismatch ) {
 
-    if (isa<LoadInst>(vi.at(0))) {
-      load_instructions.push_back(vi);
-    } else {
-      for (size_t i=0 ; i < vi.size() ; ++i ) {
-	for (Use& u : vi[i]->operands()) {
-	  if (isa<Instruction>(u.get())) {
-	    visit[i].insert(u.get());
+      std::vector<Instruction*> vi;
+      if (!get_last_elements_as_instructions(visit[q],vi)) {
+	mismatch=true;
+	break;
+      }
+
+      if (isa<LoadInst>(vi.at(0))) {
+	push_back_if_not_already_in( load_instructions, vi );
+      } else {
+	for (size_t i=0 ; i < vi.size() ; ++i ) {
+	  for (Use& u : vi[i]->operands()) {
+	    if (isa<Instruction>(u.get())) {
+	      visit[q][i].insert(u.get());
+	    }
 	  }
 	}
       }
