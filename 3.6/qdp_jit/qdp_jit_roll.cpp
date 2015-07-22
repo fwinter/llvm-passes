@@ -610,7 +610,7 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
   //function->dump();
 
 
-  return insert_before;
+  return BB0;
 }
 
 
