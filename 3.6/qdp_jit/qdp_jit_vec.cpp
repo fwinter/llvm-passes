@@ -39,7 +39,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_vec0"
+#define SV_NAME "qdp_jit_vec"
 #define DEBUG_TYPE SV_NAME
 
 

@@ -38,7 +38,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_roll0"
+#define SV_NAME "qdp_jit_roll"
 #define DEBUG_TYPE SV_NAME
 
 //STATISTIC(NumLoadsAnalyzed, "Number of loads analyzed for combining");
@@ -55,12 +55,8 @@ public:
   qdp_jit_roll()
       : ModulePass(ID),
         C(nullptr), DL(nullptr) {
-    //initializeSROAPass(*PassRegistry::getPassRegistry());
   }
   
-  //  using llvm::Pass::doInitialization;
-  //bool doInitialization(Function &) override;
-  //bool runOnFunction(Function &F) override;
   bool runOnModule(Module &M) override;
 
 protected:
@@ -72,17 +68,17 @@ protected:
   typedef std::vector<reduction> reductions_t;
 
   void add_GEPs(BasicBlock &BB);
-  void collectRoots( Instruction& I, SetVector<Value*>& all_roots);
-  void collectAllUses( SetVector<Value*>& to_visit, SetVector<Value*>& all_uses);
-  //  void collectAll( Instruction& I);
-  void collectForStoresAllOperandsAll( SetVector<Value*>& tree );
-  void collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands );
   bool track( SetVector<Value*>& set);
   void modify_loop_body( reduction& red , Value* ind_var , int64_t offset_normalize );
-  //bool insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* successor);
   BasicBlock* insert_loop( reductions_t::iterator cur , Function* F, BasicBlock* insert_before,BasicBlock* take_instr_from);
-  //void getAnalysisUsage(AnalysisUsage &AU) const override;
 
+  SetVector<Value*> get_leaves( Value* V );
+  SetVector<Value*> get_leaves( SetVector<Value*> V );
+  SetVector<Value*> get_stores( Value* V );
+  SetVector<Value*> get_stores( SetVector<Value*> V );
+  SetVector<Value*> get_all_linked_stores_from_store( Value* V );
+  SetVector<Value*> get_uses( Value* V );
+  SetVector<Value*> get_uses( SetVector<Value*> V );
 
 
 private:
@@ -93,105 +89,9 @@ private:
   typedef IRBuilder<true, TargetFolder> BuilderTy;
   LLVMContext *C;
   const DataLayout *DL;
-  //  AliasAnalysis *AA;
 
   BuilderTy *Builder;
 };
-}
-
-
-
-
-
-void qdp_jit_roll::collectRoots( Instruction& I, SetVector<Value*>& all_roots) {
-  //DEBUG(dbgs() << "collectRoots for " << I << "\n");
-
-  all_roots.clear();
-  std::queue<Value*> to_visit;
-
-  to_visit.push(&I);
-
-  while (!to_visit.empty()) {
-    Value* v = to_visit.front();
-    to_visit.pop();
-    Instruction* vi;
-    if ((vi = dyn_cast<Instruction>(v))) {
-      for (Use& U : vi->operands()) {
-	if (isa<Instruction>(U.get())) {
-	  to_visit.push(U.get());
-	} else {
-	  if (!isa<Constant>(U.get())) {
-	    //DEBUG(dbgs() << "An operand is a non-instruction " << *U.get() << "  root=" << *v << "\n");
-	    all_roots.insert(v);
-	  }
-	}
-      }
-    }
-  }
-}
-
-
-
-void qdp_jit_roll::collectAllInstructionOperands( SetVector<Value*>& roots, SetVector<Value*>& operands ) {
-  while (!roots.empty()) {
-    Value* v = roots.back();
-    roots.pop_back();
-    if (Instruction * vi = dyn_cast<Instruction>(v)) {
-      //DEBUG(dbgs() << "Found instruction " << *vi << "\n");
-      operands.insert(v);
-      for (Use& U : vi->operands()) {
-	roots.insert(U.get());
-      }
-    }
-  }
-}
-
-
-
-void qdp_jit_roll::collectForStoresAllOperandsAll( SetVector<Value*>& tree ) {
-  //DEBUG(dbgs() << "size of tree a) " << tree.size() << "\n");
-
-  SetVector<Value*> add_to;
-  
-  for (Value *v : tree ) {
-    if (isa<StoreInst>(*v)) {
-      //DEBUG(dbgs() << "store " << *v << "\n");
-      User* user = cast<User>(v);
-      add_to.insert( user->getOperand(1) ); // only the pointer
-    }
-  }
-
-
-  collectAllInstructionOperands(add_to,tree);
-  
-	//DEBUG(dbgs() << "operand " << *U.get() << "\n");
-	// if (isa<Instruction>(U.get())) {
-	//   DEBUG(dbgs() << "inserting " << *U.get() << "\n");
-	//   tree.insert(U.get());
-	// }
-      
-  //DEBUG(dbgs() << "size of tree b) " << tree.size() << "\n");
-}
-
-
-void qdp_jit_roll::collectAllUses( SetVector<Value*>& to_visit, SetVector<Value*>& all_uses) {
-  //DEBUG(dbgs() << "collectAllUses " << "\n");
-
-  all_uses.clear();
-
-  while (!to_visit.empty()) {
-    Value* v = to_visit.back();
-    //DEBUG(dbgs() << "to_visit size " << to_visit.size() << " visiting " << *v << "\n");
-    all_uses.insert(v);
-    to_visit.pop_back();
-
-    //DEBUG(dbgs() << "getNumUses " << v->getNumUses() << "\n");
-    for (Use &U : v->uses()) {
-      //DEBUG(dbgs() << "user " << *U.getUser() << "\n");
-      to_visit.insert(U.getUser());
-    }
-
-  }
 }
 
 
@@ -616,6 +516,132 @@ BasicBlock* qdp_jit_roll::insert_loop( reductions_t::iterator cur , Function* F,
 
 
 
+
+SetVector<Value*> qdp_jit_roll::get_stores( Value* V )
+{
+  SetVector<Value*> stores;
+  SetVector<Value*> to_visit;
+  to_visit.insert(V);
+
+  while (!to_visit.empty()) {
+    Value* v = to_visit.back();
+    to_visit.pop_back();
+    Instruction* vi;
+    if ((vi = dyn_cast<Instruction>(v))) {
+      for (Use& U : vi->uses()) {
+	if (isa<StoreInst>(U.getUser())) {
+	  stores.insert(U.getUser());
+	} else if (isa<Instruction>(U.getUser())) {
+	  to_visit.insert(U.getUser());
+	}
+      }
+    }
+  }
+  return stores;
+}
+
+SetVector<Value*> qdp_jit_roll::get_leaves( Value* V )
+{
+  SetVector<Value*> leaves;
+  SetVector<Value*> to_visit;
+  to_visit.insert(V);
+
+  while (!to_visit.empty()) {
+    Value* v = to_visit.back();
+    to_visit.pop_back();
+    Instruction* vi;
+    if ((vi = dyn_cast<Instruction>(v))) {
+      bool has_inst_op = false;
+      for (Use& U : vi->operands()) {
+	if (isa<Instruction>(U.get())) {
+	  to_visit.insert(U.get());
+	  has_inst_op = true;
+	}
+	if (!has_inst_op) {
+	  leaves.insert(v);
+	}
+      }
+    }
+  }
+  return leaves;
+}
+
+SetVector<Value*> qdp_jit_roll::get_leaves( SetVector<Value*> Vec )
+{
+  SetVector<Value*> leaves;
+  for (Value* V : Vec) {
+    SetVector<Value*> tmp = get_leaves( V );
+    leaves.insert( tmp.begin() , tmp.end() );
+  }
+  return leaves;
+}
+
+SetVector<Value*> qdp_jit_roll::get_stores( SetVector<Value*> Vec )
+{
+  SetVector<Value*> stores;
+  for (Value* V : Vec) {
+    SetVector<Value*> tmp = get_stores( V );
+    stores.insert( tmp.begin() , tmp.end() );
+  }
+  return stores;
+}
+
+
+
+SetVector<Value*> qdp_jit_roll::get_all_linked_stores_from_store( Value* V )
+{
+  bool all=false;
+  SetVector<Value*> stores;
+  stores.insert(V);
+  while(!all) {
+    SetVector<Value*> new_stores;
+    new_stores = get_stores( get_leaves( stores ) );
+    all = (new_stores.size() == stores.size());
+    stores = new_stores;
+  }
+  return stores;
+}
+
+
+SetVector<Value*> qdp_jit_roll::get_uses( Value* V )
+{
+  SetVector<Value*> uses;
+  SetVector<Value*> to_visit;
+  to_visit.insert(V);
+  uses.insert( V );
+
+  while (!to_visit.empty()) {
+    Value* v = to_visit.back();
+    to_visit.pop_back();
+    Instruction* vi;
+    if ((vi = dyn_cast<Instruction>(v))) {
+      for (Use& U : vi->uses()) {
+	if (isa<Instruction>(U.getUser())) {
+	  uses.insert(U.getUser());
+	  to_visit.insert(U.getUser());
+	}
+      }
+    }
+  }
+  return uses;
+}
+
+SetVector<Value*> qdp_jit_roll::get_uses( SetVector<Value*> Vec )
+{
+  SetVector<Value*> uses;
+  for (Value* V : Vec) {
+    SetVector<Value*> tmp = get_uses( V );
+    uses.insert( tmp.begin() , tmp.end() );
+  }
+  return uses;
+}
+
+
+
+
+
+
+
 bool qdp_jit_roll::runOnModule(Module &M) {
   module = &M;
   IRBuilder<true, TargetFolder> TheBuilder(M.getContext(), TargetFolder(DL));
@@ -649,47 +675,29 @@ bool qdp_jit_roll::runOnModule(Module &M) {
   SetVector<Value*> processed;
   SetVector<Value*> for_erasure;
 
-#ifndef NDEBUG	
-  bool first_set = true;
-#endif
   int marked_erasure = 0;
   for (Instruction& I : BB) {
     if (isa<StoreInst>(I)) {
       if (processed.count( &I ) == 0 ) {
 
-#ifndef NDEBUG
-	std::stringstream ss;
-	std::string str;
-	llvm::raw_string_ostream rso(str);
+	DEBUG(dbgs() << "Found new StoreInst " << I << "\n");
+
+	SetVector<Value*> DAG = get_uses( get_leaves( get_all_linked_stores_from_store( &I ) ) );
+#if 0
+	DEBUG(dbgs() << "DAG: " << "\n");
+	for( Value* V : DAG ) {
+	  DEBUG(dbgs() << *V << "\n");
+	}
 #endif
-	DEBUG(rso << "Found new StoreInst ");
-	DEBUG(I.print(rso));
-	DEBUG(rso << "\n");
+	DEBUG(dbgs() << "Whole DAG (inst. count) = " << DAG.size() << "\n");
 
-	collectRoots(I, all_roots);
-	DEBUG(rso << "Root instructions                        = " << all_roots.size() << "\n");
-
-	SetVector<Value*> all_uses;
-	collectAllUses(all_roots,all_uses);      
-	DEBUG(rso << "Uses (of the roots)                      = " << all_uses.size() << "\n");
-
-	collectForStoresAllOperandsAll(all_uses);
-	DEBUG(rso << "Uses (incl. from other reachable stores) = " << all_uses.size() << "\n");
-
-
-	if (track(all_uses)) {
-	  for_erasure.insert( all_uses.begin(), all_uses.end() );
+	if (track(DAG)) {
+	  for_erasure.insert( DAG.begin(), DAG.end() );
 	  marked_erasure++;
 	  //DEBUG(dbgs() << "Marked for erasure!" << "\n");
 	}
 
-#ifndef NDEBUG	
-	if (first_set)
-	  dbgs() << rso.str();
-	first_set=false;
-#endif
-
-	processed.insert(all_uses.begin(),all_uses.end());
+	processed.insert(DAG.begin(),DAG.end());
 
       } else {
 	//DEBUG(dbgs() << "Found already processed StoreInst " << I << "\n");
