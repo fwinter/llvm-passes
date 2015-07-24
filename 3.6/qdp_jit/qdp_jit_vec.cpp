@@ -39,7 +39,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_vec"
+#define SV_NAME "qdp_jit_vec0"
 #define DEBUG_TYPE SV_NAME
 
 
@@ -53,7 +53,7 @@ public:
 
   qdp_jit_vec()
       : FunctionPass(ID),
-        C(nullptr), DL(nullptr), vector_length(4) {}
+        C(nullptr), DL(nullptr) {}
   
   bool runOnFunction(Function &F) override;
 
@@ -63,14 +63,15 @@ protected:
       instructions.push_back( SI );
     }
     std::vector<StoreInst*> instructions;
-    int64_t lo,hi;
+    size_t lo,hi;
   };
   typedef std::vector<reduction> reductions_t;
   typedef std::vector<reduction>::iterator reductions_iterator;
 
-  void track( StoreInst* SI , int64_t offset );
+  void track( StoreInst* SI , size_t offset , size_t vector_length );
   void vectorize( reductions_iterator red );
   int vectorize_loads( std::vector<std::vector<Instruction*> >& load_instructions );
+  void vectorize_stores( reductions_iterator red );
   //void vectorize_all_uses( std::vector<Value*> vector_loads );
   void vectorize_all_uses( std::vector<std::pair<Value*,Value*> > scalar_vector_loads);
   void mark_for_erasure_all_operands(Value* V);
@@ -101,7 +102,8 @@ private:
   LLVMContext *C;
   const DataLayout *DL;
   BuilderTy *Builder;
-  int64_t vector_length;
+  size_t vec_len;
+  bool   vec_len_set = false;
 };
 }
 
@@ -166,6 +168,32 @@ Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
 {
   DEBUG(dbgs() << "get_vector_version: scalar version: " << *scalar_version << "\n");
 
+  if (!isa<Instruction>(scalar_version)) {
+
+    if (Constant* C = dyn_cast<Constant>(scalar_version)) {
+      return Builder->Insert( ConstantVector::getSplat( vec_len , C ) );
+    }
+
+    assert( 0 && "scalar version is not an instruction, and not a constant" );
+    return NULL;
+  }
+
+
+#if 0
+  // We might not need this
+  if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(scalar_version)) {
+    Instruction* GEPcl = clone_with_operands(GEP);
+    printf("waring using built in vector size 4 here!!\n");
+    VectorType *VecTy = VectorType::get( GEP->getPointerOperandType() , 4 );
+    Value *VecPtr = Builder->CreateBitCast(GEPcl,VecTy->getPointerTo());
+    DEBUG(dbgs() << "it's a GEP\n");
+    DEBUG(dbgs() << *VecTy << "\n");
+    DEBUG(dbgs() << *VecPtr << "\n");
+    return VecPtr;
+  }
+#endif
+
+
   if (StoreInst* SI = dyn_cast<StoreInst>(scalar_version)) {
     unsigned AS = SI->getPointerAddressSpace();
 
@@ -184,6 +212,7 @@ Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
 
     Instruction* GEPcl = clone_with_operands( GEP );
 
+    DEBUG(dbgs() << "SI->getValueOp = " << *SI->getValueOperand() << "\n");
     Value* vec_value  = get_vector_version( SI->getValueOperand() );
     Value *VecPtr     = Builder->CreateBitCast( GEPcl , vec_value->getType()->getPointerTo(AS) );
     Value* vecstore = Builder->CreateStore( vec_value , VecPtr );
@@ -211,39 +240,63 @@ Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
   //I->getOperand(0);
 
   unsigned Opcode = I->getOpcode();
+  Value* V;
+
   switch (Opcode) {
-  case Instruction::FMul: {
-    Value* V = Builder->CreateFMul( get_vector_version( operands.at(0) ) ,
-				    get_vector_version( operands.at(1) ) );
-    scalar_vector_pairs.push_back( std::make_pair( I , V ) );
-    DEBUG(dbgs() << "vec mul created " << *V << "\n");
-    return V;
-  }
+  case Instruction::FMul: 
+    V = Builder->CreateFMul( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
     break;
-  case Instruction::FAdd: {
-    Value* V = Builder->CreateFAdd( get_vector_version( operands.at(0) ) ,
-				    get_vector_version( operands.at(1) ) );
-    scalar_vector_pairs.push_back( std::make_pair( I , V ) );
-    DEBUG(dbgs() << "vec add created " << *V << "\n");
-    return V;
-  }
+  case Instruction::FAdd: 
+    V = Builder->CreateFAdd( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
     break;
-  case Instruction::FSub: {
-    Value* V = Builder->CreateFSub( get_vector_version( operands.at(0) ) ,
-				    get_vector_version( operands.at(1) ) );
-    scalar_vector_pairs.push_back( std::make_pair( I , V ) );
-    DEBUG(dbgs() << "vec sub created " << *V << "\n");
-    return V;
-  }
+  case Instruction::FSub: 
+    V = Builder->CreateFSub( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
     break;
+  case Instruction::Mul:
+    V = Builder->CreateMul( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::Add:
+    V = Builder->CreateAdd( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::Sub:
+    V = Builder->CreateSub( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::And:
+    V = Builder->CreateAnd( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::AShr:
+    V = Builder->CreateAShr( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+#if 0
+  case Instruction::FRem:
+    V = Builder->CreateFRem( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::SRem:
+    V = Builder->CreateSRem( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::Shl:
+    V = Builder->CreateShl( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::Or:
+    V = Builder->CreateOr( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::Xor:
+    V = Builder->CreateXor( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::SDiv:
+    V = Builder->CreateSDiv( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::FDiv:
+    V = Builder->CreateFDiv( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+#endif
   default:
     dbgs() << Instruction::getOpcodeName(Opcode) << "\n";
     assert( 0 && "opcode not found!" );
-    return NULL;
+    V = NULL;
   }
-
-  assert( 0 && "strange!" );
-  return NULL;
+  scalar_vector_pairs.push_back( std::make_pair( I , V ) );
+  return V;
 }
 
 
@@ -310,10 +363,11 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
 
   if (load_instructions.empty())
     return 0;
-  int vec_len = load_instructions.at(0).size();
+
   int load_vec_elem = 0;
   for( std::vector<Instruction*>& VI : load_instructions ) {
     DEBUG(dbgs() << "Processing vector of loads number " << load_vec_elem++ << "\n");
+    assert( VI.size() == vec_len && "length of vector of loads does not match vec_len" );
     int loads_consec = true;
     uint64_t lo,hi;
     bool first = true;
@@ -592,10 +646,30 @@ void qdp_jit_vec::push_back_if_not_already_in( std::vector< std::vector<Instruct
 }
 
 
+void qdp_jit_vec::vectorize_stores( reductions_iterator red )
+{
+  assert( red->instructions.size() == vec_len && "reduction does not match vec_len" );
+  get_vector_version( *red->instructions.begin() );
+
+  for( StoreInst* SI : red->instructions ) {
+    stores_processed.insert( SI );
+    for_erasure.insert(SI);
+    Value* V = SI->getOperand(1);
+    if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(V)) {
+      for_erasure.insert(V);
+    }
+  }
+
+}
+
+
 
 void qdp_jit_vec::vectorize( reductions_iterator red )
 {
-  int vec_len = red->hi - red->lo;
+  assert( ((!vec_len_set) || (vec_len == red->hi - red->lo)) && "Vector length has changed!");
+
+  vec_len = red->hi - red->lo;
+  vec_len_set = true;
 
   std::vector<std::vector<Instruction*> > load_instructions;
 
@@ -660,14 +734,19 @@ void qdp_jit_vec::vectorize( reductions_iterator red )
      DEBUG(dbgs() << "mismatch!\n");
   } else {
      DEBUG(dbgs() << "match!\n");
-     vectorize_loads( load_instructions );
-     DEBUG(dbgs() << "vectorization successful on set of " << load_instructions.size() << " load sets\n");
+     if (load_instructions.size()) {
+       vectorize_loads( load_instructions );
+       DEBUG(dbgs() << "vectorization successful on set of " << load_instructions.size() << " load sets\n");
+     } else {
+       vectorize_stores( red );
+       DEBUG(dbgs() << "vectorization of stores successful.\n");
+     }
   }
 }
 
 
 
-void qdp_jit_vec::track( StoreInst* SI , int64_t offset )
+void qdp_jit_vec::track( StoreInst* SI , size_t offset , size_t vector_length )
 {
   //DEBUG(dbgs() << ">>>>> track " << *SI << " " << offset << "\n");
 
@@ -782,9 +861,9 @@ bool qdp_jit_vec::runOnFunction(Function &F) {
       if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(V)) {
 	//DEBUG(dbgs() << "Found GEP " << *GEP << "\n");
 	if (ConstantInt * CI = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
-	  int64_t off = CI->getZExtValue();
+	  size_t off = CI->getZExtValue();
 	  //DEBUG(dbgs() << " number = " << off << "\n");
-	  track( SI , off );
+	  track( SI , off , 4 );
 	} else {
 	  assert( 0 && "first operand of GEP is not a constant" );
 	}

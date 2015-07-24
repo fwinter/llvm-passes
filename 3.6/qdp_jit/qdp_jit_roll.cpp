@@ -38,7 +38,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_roll"
+#define SV_NAME "qdp_jit_roll0"
 #define DEBUG_TYPE SV_NAME
 
 //STATISTIC(NumLoadsAnalyzed, "Number of loads analyzed for combining");
