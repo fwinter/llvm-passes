@@ -39,7 +39,7 @@
 
 using namespace llvm;
 
-#define SV_NAME "qdp_jit_vec0"
+#define SV_NAME "qdp_jit_vec"
 #define DEBUG_TYPE SV_NAME
 
 
@@ -267,7 +267,19 @@ Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
   case Instruction::AShr:
     V = Builder->CreateAShr( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
     break;
-#if 0
+  case Instruction::ICmp:
+    V = Builder->CreateICmp( cast<CmpInst>(I)->getPredicate() ,
+			     get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
+    break;
+  case Instruction::BitCast:
+    V = Builder->CreateBitCast( get_vector_version( operands.at(0) ) , VectorType::get( I->getType() , vec_len ) );
+    break;
+  case Instruction::SExt:
+    V = Builder->CreateSExt( get_vector_version( operands.at(0) ) , VectorType::get( I->getType() , vec_len ) );
+    break;
+  case Instruction::Trunc:
+    V = Builder->CreateTrunc( get_vector_version( operands.at(0) ) , VectorType::get( I->getType() , vec_len ) );
+    break;
   case Instruction::FRem:
     V = Builder->CreateFRem( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
     break;
@@ -289,7 +301,6 @@ Value* qdp_jit_vec::get_vector_version( Value* scalar_version )
   case Instruction::FDiv:
     V = Builder->CreateFDiv( get_vector_version( operands.at(0) ) , get_vector_version( operands.at(1) ) );
     break;
-#endif
   default:
     dbgs() << Instruction::getOpcodeName(Opcode) << "\n";
     assert( 0 && "opcode not found!" );
@@ -655,7 +666,7 @@ void qdp_jit_vec::vectorize_stores( reductions_iterator red )
     stores_processed.insert( SI );
     for_erasure.insert(SI);
     Value* V = SI->getOperand(1);
-    if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(V)) {
+    if (isa<GetElementPtrInst>(V)) {
       for_erasure.insert(V);
     }
   }
