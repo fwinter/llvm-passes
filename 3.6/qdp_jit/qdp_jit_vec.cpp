@@ -51,9 +51,9 @@ public:
   const char *getPassName() const override { return "qdp_jit_vec"; }
   static char ID;
 
-  qdp_jit_vec()
+  qdp_jit_vec(size_t vec_len=4)
       : FunctionPass(ID),
-        C(nullptr), DL(nullptr) {}
+        C(nullptr), DL(nullptr), vec_len(vec_len) {}
   
   bool runOnFunction(Function &F) override;
 
@@ -103,7 +103,6 @@ private:
   const DataLayout *DL;
   BuilderTy *Builder;
   size_t vec_len;
-  bool   vec_len_set = false;
 };
 }
 
@@ -677,10 +676,9 @@ void qdp_jit_vec::vectorize_stores( reductions_iterator red )
 
 void qdp_jit_vec::vectorize( reductions_iterator red )
 {
-  assert( ((!vec_len_set) || (vec_len == red->hi - red->lo)) && "Vector length has changed!");
+  assert( (vec_len == red->hi - red->lo) && "Vector length has changed!");
 
   vec_len = red->hi - red->lo;
-  vec_len_set = true;
 
   std::vector<std::vector<Instruction*> > load_instructions;
 
@@ -874,7 +872,7 @@ bool qdp_jit_vec::runOnFunction(Function &F) {
 	if (ConstantInt * CI = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
 	  size_t off = CI->getZExtValue();
 	  //DEBUG(dbgs() << " number = " << off << "\n");
-	  track( SI , off , 4 );
+	  track( SI , off , vec_len );
 	} else {
 	  assert( 0 && "first operand of GEP is not a constant" );
 	}
@@ -921,8 +919,8 @@ char qdp_jit_vec::ID = 0;
 static RegisterPass<qdp_jit_vec> X(SV_NAME, "QDP-JIT vectorize code");
 
 
-FunctionPass *llvm::create_qdp_jit_vec_pass() {
-  return new qdp_jit_vec();
+FunctionPass *llvm::create_qdp_jit_vec_pass(size_t vec_len) {
+  return new qdp_jit_vec(vec_len);
 }
 
 

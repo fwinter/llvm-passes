@@ -91,6 +91,8 @@ private:
   const DataLayout *DL;
 
   BuilderTy *Builder;
+
+  int current_id = 0;
 };
 }
 
@@ -140,8 +142,6 @@ void qdp_jit_roll::add_GEPs(BasicBlock &BB) {
 
 bool qdp_jit_roll::track( SetVector<Value*>& set) {
   DEBUG(dbgs() << "Track set with " << set.size() << " instructions.\n");
-
-  static int id;
 
   // if (reductions.empty()) {
   //   reductions.push_back( reduction() );
@@ -260,11 +260,11 @@ bool qdp_jit_roll::track( SetVector<Value*>& set) {
     return true;
   }
 
-  DEBUG(dbgs() << "No existing reduction matches, will add another reduction, with id = " << id << "\n");
+  DEBUG(dbgs() << "No existing reduction matches, will add another reduction, with id = " << current_id << "\n");
   reductions.push_back( reduction() );
   reductions.back().instructions.insert( set.begin() , set.end() );
   reductions.back().offsets.push_back( GEP_offsets );
-  reductions.back().id = id++;
+  reductions.back().id = current_id++;
   return false;
 }
 
