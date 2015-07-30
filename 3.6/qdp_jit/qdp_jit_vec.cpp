@@ -422,9 +422,16 @@ int qdp_jit_vec::vectorize_loads( std::vector<std::vector<Instruction*> >& load_
       unsigned AS = LI->getPointerAddressSpace();
       VectorType *VecTy = VectorType::get( LI->getType() , vec_len );
 
+      unsigned bitwidth = LI->getType()->getPrimitiveSizeInBits();
+      unsigned bytewidth = bitwidth == 1 ? 1 : bitwidth/8;
+      DEBUG(dbgs() << "bit/byte width of load instr trype: " << bitwidth << "/" << bytewidth << "\n");
+ 
       //Builder->SetInsertPoint( GEP );
       Value *VecPtr = Builder->CreateBitCast(GEPcl,VecTy->getPointerTo(AS));
-      Value *VecLoad = Builder->CreateLoad( VecPtr );
+      //Value *VecLoad = Builder->CreateLoad( VecPtr );
+      
+      unsigned align = lo % vec_len == 0 ? bytewidth * vec_len : bytewidth;
+      Value *VecLoad = Builder->CreateAlignedLoad( VecPtr , align );
 
       //DEBUG(dbgs() << "created vector load: " << *VecLoad << "\n");
       //function->dump();
